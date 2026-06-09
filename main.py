@@ -3,8 +3,12 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 
-from PyQt6.QtWidgets import QApplication, QMainWindow, QStatusBar, QWidget, QHBoxLayout, QVBoxLayout, QListWidget, QTableWidget, QTextBrowser, QDialog, QLineEdit, QTextEdit, QPushButton
+import imaplib
+import email
+
+from PyQt6.QtWidgets import QApplication, QMainWindow, QStatusBar, QWidget, QHBoxLayout, QVBoxLayout, QListWidget, QTableWidget, QTextBrowser, QDialog, QLineEdit, QTextEdit, QPushButton, QTableWidgetItem
 from PyQt6.QtGui import QAction
+from PyQt6.QtCore import QThread, QObject, pyqtSignal
 from smtplib import SMTP_SSL
 from email.message import EmailMessage
 
@@ -46,6 +50,10 @@ class MainWindow(QMainWindow):
         #right row
         content_layout = QVBoxLayout()
         self.overview = QTableWidget()
+        self.overview.setColumnCount(2)
+        self.overview.setHorizontalHeaderLabels(["Sender", "Subject"])
+        self.overview.setRowCount(5)
+
         self.details = QTextBrowser()
         content_layout.addWidget(self.overview)
         content_layout.addWidget(self.details)
@@ -54,11 +62,26 @@ class MainWindow(QMainWindow):
         
         self.setStatusBar(QStatusBar(self))
         self.statusBar().showMessage("Bereit")
+
+        self.start_mail_loading()
     
     def open_compose_dialog(self):
         dialog = ComposeDialog()
         dialog.exec()
-        
+
+    def start_mail_loading(self):
+        self.loading_thread = QThread()
+        self.worker = MailWorker()
+        self.worker.moveToThread(self.loading_thread)
+        self.loading_thread.started.connect(self.worker.run)
+        mail_loaded = self.worker.mail_loaded.connect(self.add_mail_to_table)
+        self.loading_thread.start()
+
+    def add_mail_to_table(self, row, sender, subject):
+        self.overview.setItem(row, 0, QTableWidgetItem(sender))
+        self.overview.setItem(row, 1, QTableWidgetItem(subject))
+
+     
 class ComposeDialog(QDialog):
     def __init__(self):
         super().__init__()
@@ -87,6 +110,29 @@ class ComposeDialog(QDialog):
             server.send_message(msg)
         
         self.accept()
+
+class MailWorker(QObject):
+    mail_loaded = pyqtSignal(int,str,str)
+    def run(self):
+        with imaplib.IMAP4_SSL("imap.gmail.com") as mail_server:
+            mail_server.login(os.getenv("EMAIL_USER"), os.getenv("EMAIL_PASSWORD"))
+            mail_server.select("INBOX")
+            #search all mails
+            status, data = mail_server.search(None, "ALL")
+            mail_ids = data[0].split()
+            mail_ids.reverse()
+            #mail_len = mail_ids.len()
+            #print(mail_len)
+            latest_id = mail_ids[:5]
+            
+            for row_index, mail_id in enumerate(latest_id):
+            #get latest mail
+                status, mail_data = mail_server.fetch(mail_id, "(RFC822)")
+                loaded_msg = email.message_from_bytes(mail_data[0][1])
+                loaded_sender = loaded_msg["From"]
+                loaded_subject = loaded_msg["Subject"]
+                self.mail_loaded.emit(row_index, loaded_sender, loaded_subject)
+
         
 app = QApplication(sys.argv)
 
