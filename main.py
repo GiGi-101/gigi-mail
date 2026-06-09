@@ -52,9 +52,11 @@ class MainWindow(QMainWindow):
         self.overview = QTableWidget()
         self.overview.setColumnCount(2)
         self.overview.setHorizontalHeaderLabels(["Sender", "Subject"])
-        self.overview.setRowCount(5)
+        self.overview.setRowCount(29)
 
+        #mail content
         self.details = QTextBrowser()
+        self.overview.cellClicked.connect(self.show_details)
         content_layout.addWidget(self.overview)
         content_layout.addWidget(self.details)
         
@@ -64,6 +66,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Bereit")
 
         self.start_mail_loading()
+
+        self.mail_storage = {}
     
     def open_compose_dialog(self):
         dialog = ComposeDialog()
@@ -74,14 +78,20 @@ class MainWindow(QMainWindow):
         self.worker = MailWorker()
         self.worker.moveToThread(self.loading_thread)
         self.loading_thread.started.connect(self.worker.run)
-        mail_loaded = self.worker.mail_loaded.connect(self.add_mail_to_table)
+        mail_loaded = self.worker.mail_loaded.connect(self.on_mail_loaded)
         self.loading_thread.start()
 
-    def add_mail_to_table(self, row, sender, subject):
+    def on_mail_loaded(self, row, sender, subject, content):
         self.overview.setItem(row, 0, QTableWidgetItem(sender))
         self.overview.setItem(row, 1, QTableWidgetItem(subject))
+        self.mail_storage[row] = content
 
-     
+    def show_details(self, row, column):
+        subject_text = self.overview.item(row, 1).text()
+        mail_content = self.mail_storage[row]
+        combined_fields = f"Subject: {subject_text}\n\n{mail_content}"
+        self.details.setText(combined_fields)
+
 class ComposeDialog(QDialog):
     def __init__(self):
         super().__init__()
@@ -112,7 +122,7 @@ class ComposeDialog(QDialog):
         self.accept()
 
 class MailWorker(QObject):
-    mail_loaded = pyqtSignal(int,str,str)
+    mail_loaded = pyqtSignal(int, str, str, str)
     def run(self):
         with imaplib.IMAP4_SSL("imap.gmail.com") as mail_server:
             mail_server.login(os.getenv("EMAIL_USER"), os.getenv("EMAIL_PASSWORD"))
@@ -121,17 +131,28 @@ class MailWorker(QObject):
             status, data = mail_server.search(None, "ALL")
             mail_ids = data[0].split()
             mail_ids.reverse()
-            #mail_len = mail_ids.len()
-            #print(mail_len)
-            latest_id = mail_ids[:5]
             
-            for row_index, mail_id in enumerate(latest_id):
-            #get latest mail
+            #get data for current mail
+            for row_index, mail_id in enumerate(mail_ids):
                 status, mail_data = mail_server.fetch(mail_id, "(RFC822)")
                 loaded_msg = email.message_from_bytes(mail_data[0][1])
                 loaded_sender = loaded_msg["From"]
                 loaded_subject = loaded_msg["Subject"]
-                self.mail_loaded.emit(row_index, loaded_sender, loaded_subject)
+                # check if multipart
+                if loaded_msg.is_multipart():
+                    content = ""
+                    # check multiparts
+                    for part in loaded_msg.walk():
+                        # is text/plain?
+                        if part.get_content_type() == "text/plain":
+                            # found
+                            content = part.get_payload(decode=True).decode(errors="ignore")
+                            break  # cancel loop
+                else:
+                    # is not multipart
+                    content = loaded_msg.get_payload(decode=True).decode(errors="ignore")
+                self.mail_loaded.emit(row_index, loaded_sender, loaded_subject, content)
+
 
         
 app = QApplication(sys.argv)
