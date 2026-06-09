@@ -1,7 +1,12 @@
 import sys
+import os
+from dotenv import load_dotenv
+load_dotenv()
+
 from PyQt6.QtWidgets import QApplication, QMainWindow, QStatusBar, QWidget, QHBoxLayout, QVBoxLayout, QListWidget, QTableWidget, QTextBrowser, QDialog, QLineEdit, QTextEdit, QPushButton
 from PyQt6.QtGui import QAction
-
+from smtplib import SMTP_SSL
+from email.message import EmailMessage
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -64,10 +69,24 @@ class ComposeDialog(QDialog):
         self.subject = QLineEdit()
         self.text = QTextEdit()
         self.send_button = QPushButton("Send")
+        self.send_button.clicked.connect(self.send_mail)
         dialog_layout.addWidget(self.receiver)
         dialog_layout.addWidget(self.subject)
         dialog_layout.addWidget(self.text)
         dialog_layout.addWidget(self.send_button)
+        
+    def send_mail(self):
+        msg = EmailMessage()
+        msg["Subject"] = self.subject.text()
+        msg["From"] = os.getenv("EMAIL_USER")
+        msg["To"] = self.receiver.text()
+        msg.set_content(self.text.toPlainText())
+        
+        with SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(os.getenv("EMAIL_USER"), os.getenv("EMAIL_PASSWORD"))
+            server.send_message(msg)
+        
+        self.accept()
         
 app = QApplication(sys.argv)
 
