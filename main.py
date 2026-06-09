@@ -1,5 +1,6 @@
 import sys
 import os
+import time
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -9,8 +10,46 @@ import email
 from PyQt6.QtWidgets import QApplication, QMainWindow, QStatusBar, QWidget, QHBoxLayout, QVBoxLayout, QListWidget, QTableWidget, QTextBrowser, QDialog, QLineEdit, QTextEdit, QPushButton, QTableWidgetItem
 from PyQt6.QtGui import QAction
 from PyQt6.QtCore import QThread, QObject, pyqtSignal
+from PyQt6.QtWebEngineWidgets import QWebEngineView
 from smtplib import SMTP_SSL
 from email.message import EmailMessage
+
+class MailContentWorker(QObject):
+    # send html to MainWindow 
+    content_loaded = pyqtSignal(str) 
+
+    def __init__(self, mail_id):
+        super().__init__()
+        self.mail_id = mail_id
+
+    def run(self):
+        try:
+            print(f"\n--- Starte Ladevorgang für Mail-ID {self.mail_id} ---")
+            
+            with imaplib.IMAP4_SSL("imap.gmail.com") as mail_server:
+                mail_server.login(os.getenv("EMAIL_USER"), os.getenv("EMAIL_PASSWORD"))
+                mail_server.select("INBOX")
+                
+                status, mail_data = mail_server.fetch(self.mail_id, "(RFC822)")
+
+                loaded_msg = email.message_from_bytes(mail_data[0][1])
+
+                content = ""
+                if loaded_msg.is_multipart():
+                    for part in loaded_msg.walk():
+                        if part.get_content_type() == "text/html":
+                            content = part.get_payload(decode=True).decode(errors="ignore")
+                            break
+                else:
+                    content = loaded_msg.get_payload(decode=True).decode(errors="ignore")
+                
+                if not content:
+                    content = loaded_msg.get_payload(decode=True).decode(errors="ignore")
+
+                self.content_loaded.emit(content)
+
+        except Exception as e:
+            self.content_loaded.emit(f"Fehler beim Laden: {e}")
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -55,7 +94,9 @@ class MainWindow(QMainWindow):
         self.overview.setRowCount(29)
 
         #mail content
-        self.details = QTextBrowser()
+        self.details = QWebEngineView()
+        self.details.setMinimumHeight(400)
+
         self.overview.cellClicked.connect(self.show_details)
         content_layout.addWidget(self.overview)
         content_layout.addWidget(self.details)
@@ -81,16 +122,39 @@ class MainWindow(QMainWindow):
         mail_loaded = self.worker.mail_loaded.connect(self.on_mail_loaded)
         self.loading_thread.start()
 
-    def on_mail_loaded(self, row, sender, subject, content):
+    def on_mail_loaded(self, row, sender, subject, mail_id):
         self.overview.setItem(row, 0, QTableWidgetItem(sender))
         self.overview.setItem(row, 1, QTableWidgetItem(subject))
-        self.mail_storage[row] = content
+        self.mail_storage[row] = mail_id
 
     def show_details(self, row, column):
-        subject_text = self.overview.item(row, 1).text()
-        mail_content = self.mail_storage[row]
-        combined_fields = f"Subject: {subject_text}\n\n{mail_content}"
-        self.details.setText(combined_fields)
+        mail_id = self.mail_storage.get(row)
+        if not mail_id:
+            return
+
+        self.details.setHtml("<h3>⏳ Lade E-Mail-Inhalt...</h3>")
+
+        # 1. Den Spezial-Worker erstellen und ihm die ID geben
+        self.content_worker = MailContentWorker(mail_id)
+        self.content_thread = QThread()
+        
+        self.content_worker.moveToThread(self.content_thread)
+        
+        # 2. Signale verknüpfen
+        self.content_thread.started.connect(self.content_worker.run)
+        # Wenn der Text da ist, werfen wir ihn in eine neue Methode "display_content"
+        self.content_worker.content_loaded.connect(self.display_content) 
+        
+        self.content_worker.content_loaded.connect(self.content_thread.quit)
+        self.content_worker.content_loaded.connect(self.content_worker.deleteLater)
+        self.content_thread.finished.connect(self.content_thread.deleteLater)
+
+        # 3. Worker starten
+        self.content_thread.start()
+
+    # Neue, kleine Empfänger-Methode
+    def display_content(self, html_content):
+        self.details.setHtml(html_content)
 
 class ComposeDialog(QDialog):
     def __init__(self):
@@ -131,27 +195,18 @@ class MailWorker(QObject):
             status, data = mail_server.search(None, "ALL")
             mail_ids = data[0].split()
             mail_ids.reverse()
-            
-            #get data for current mail
-            for row_index, mail_id in enumerate(mail_ids):
-                status, mail_data = mail_server.fetch(mail_id, "(RFC822)")
+
+            for row_index, mail_id in enumerate(mail_ids[:15]):
+                status, mail_data = mail_server.fetch(mail_id, "(RFC822.HEADER)")
                 loaded_msg = email.message_from_bytes(mail_data[0][1])
-                loaded_sender = loaded_msg["From"]
-                loaded_subject = loaded_msg["Subject"]
-                # check if multipart
-                if loaded_msg.is_multipart():
-                    content = ""
-                    # check multiparts
-                    for part in loaded_msg.walk():
-                        # is text/plain?
-                        if part.get_content_type() == "text/plain":
-                            # found
-                            content = part.get_payload(decode=True).decode(errors="ignore")
-                            break  # cancel loop
-                else:
-                    # is not multipart
-                    content = loaded_msg.get_payload(decode=True).decode(errors="ignore")
-                self.mail_loaded.emit(row_index, loaded_sender, loaded_subject, content)
+
+                # .get() verhindert Fehler, falls mal ein Betreff komplett leer ist
+                loaded_sender = loaded_msg.get("From", "Unbekannt")
+                loaded_subject = loaded_msg.get("Subject", "Kein Betreff")
+
+                mail_id_str = mail_id.decode()
+                
+                self.mail_loaded.emit(row_index, loaded_sender, loaded_subject, mail_id_str)
 
 
         
