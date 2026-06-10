@@ -7,7 +7,7 @@ load_dotenv()
 import imaplib
 import email
 
-from PyQt6.QtWidgets import QApplication, QMainWindow, QStatusBar, QWidget, QHBoxLayout, QVBoxLayout, QListWidget, QTableWidget, QTextBrowser, QDialog, QLineEdit, QTextEdit, QPushButton, QTableWidgetItem
+from PyQt6.QtWidgets import QApplication, QMainWindow, QStatusBar, QWidget, QHBoxLayout, QVBoxLayout, QListWidget, QTableWidget, QStackedWidget, QDialog, QLineEdit, QTextEdit, QPushButton, QTableWidgetItem
 from PyQt6.QtGui import QAction
 from PyQt6.QtCore import QThread, QObject, pyqtSignal
 from PyQt6.QtWebEngineWidgets import QWebEngineView
@@ -24,8 +24,6 @@ class MailContentWorker(QObject):
 
     def run(self):
         try:
-            print(f"\n--- Starte Ladevorgang für Mail-ID {self.mail_id} ---")
-            
             with imaplib.IMAP4_SSL("imap.gmail.com") as mail_server:
                 mail_server.login(os.getenv("EMAIL_USER"), os.getenv("EMAIL_PASSWORD"))
                 mail_server.select("INBOX")
@@ -87,19 +85,39 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(self.list_widget)
         
         #right row
+        self.manager_layout = QStackedWidget()
+        self.page_overview = QWidget()
+        self.page_overview_layout = QVBoxLayout()
+        self.page_overview.setLayout(self.page_overview_layout)
+        
+        self.details = QWebEngineView()
+        self.details.setMinimumHeight(400)
+        self.back_button = QPushButton("Back")
+        self.back_button.clicked.connect(self.back_to_overview)
+        
+        self.page_details = QWidget()
+        self.page_details_layout = QVBoxLayout()
+        self.page_details.setLayout(self.page_details_layout)
+        
+        self.page_details_layout.addWidget(self.back_button)
+        self.page_details_layout.addWidget(self.details)
+        
+        self.manager_layout.addWidget(self.page_overview)
+        self.manager_layout.addWidget(self.page_details)
+        
         content_layout = QVBoxLayout()
+        content_layout.addWidget(self.manager_layout)
         self.overview = QTableWidget()
         self.overview.setColumnCount(2)
         self.overview.setHorizontalHeaderLabels(["Sender", "Subject"])
         self.overview.setRowCount(29)
+        self.page_overview_layout.addWidget(self.overview)
 
         #mail content
-        self.details = QWebEngineView()
-        self.details.setMinimumHeight(400)
 
         self.overview.cellClicked.connect(self.show_details)
-        content_layout.addWidget(self.overview)
-        content_layout.addWidget(self.details)
+        #content_layout.addWidget(self.overview)
+        #content_layout.addWidget(self.details)
         
         main_layout.addLayout(content_layout)
         
@@ -129,6 +147,7 @@ class MainWindow(QMainWindow):
 
     def show_details(self, row, column):
         mail_id = self.mail_storage.get(row)
+        self.manager_layout.setCurrentIndex(1)
         if not mail_id:
             return
 
@@ -155,7 +174,10 @@ class MainWindow(QMainWindow):
     # Neue, kleine Empfänger-Methode
     def display_content(self, html_content):
         self.details.setHtml(html_content)
-
+    
+    def back_to_overview(self):
+        self.manager_layout.setCurrentIndex(0)
+        
 class ComposeDialog(QDialog):
     def __init__(self):
         super().__init__()
