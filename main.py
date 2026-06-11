@@ -8,7 +8,7 @@ import email
 
 from PyQt6.QtWidgets import QApplication, QMainWindow, QStatusBar, QWidget, QHBoxLayout, QVBoxLayout, QListWidget, QTableWidget, QStackedWidget, QDialog, QLineEdit, QTextEdit, QPushButton, QTableWidgetItem, QLabel
 from PyQt6.QtGui import QAction
-from PyQt6.QtCore import QThread, QObject, pyqtSignal
+from PyQt6.QtCore import QTimer, QThread, QObject, pyqtSignal
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from smtplib import SMTP_SSL
 
@@ -52,6 +52,10 @@ class MainWindow(QMainWindow):
         self.init_ui()
         
     def init_ui(self):
+        self.update_timer = QTimer(self)
+        self.update_timer.timeout.connect(self.start_mail_loading)
+        self.update_timer.start(10000)  # Alle 10 Sekunden überprüfen
+        
         menuBar = self.menuBar()
         file_menu = menuBar.addMenu("File")
         
@@ -117,7 +121,7 @@ class MainWindow(QMainWindow):
         self.start_mail_loading()
 
         self.mail_storage = {}
-    
+        
     def open_compose_dialog(self):
         dialog = ComposeDialog()
         dialog.exec()
@@ -125,19 +129,39 @@ class MainWindow(QMainWindow):
     def start_mail_loading(self):
         self.loading_thread = QThread()
         self.worker = MailWorker()
+        self.worker.top_mail_id = getattr(self, 'top_mail_id', None)
         self.worker.moveToThread(self.loading_thread)
+        
         self.loading_thread.started.connect(self.worker.run)
-        mail_loaded = self.worker.mail_loaded.connect(self.on_mail_loaded)
+        self.worker.mail_loaded.connect(self.on_mail_loaded)
+        
+        #clean up worker
+        self.worker.finished.connect(self.loading_thread.quit)                  #quit thread
+        self.worker.finished.connect(self.worker.deleteLater)                   #delete from ram
+        self.loading_thread.finished.connect(self.loading_thread.deleteLater)   #delete thread after stopping
+        
         self.loading_thread.start()
 
     def on_mail_loaded(self, row, sender, subject, date, mail_id):
-        current_count = self.overview.rowCount()
+        if self.overview.rowCount() > 0 and getattr(self, "top_mail_id", None) is not None:
+            target_row = 0
+            new_storage = {}
+            
+            for row_id, m_id in self.mail_storage.items():
+                new_storage[row_id+1] = m_id
+            self.mail_storage = new_storage
+        else:
+            target_row = self.overview.rowCount()
+            
+        current_count = target_row
         self.overview.insertRow(current_count)
         self.overview.setItem(current_count, 0, QTableWidgetItem(sender))
         self.overview.setItem(current_count, 1, QTableWidgetItem(subject))
         self.overview.setItem(current_count, 2, QTableWidgetItem(date))
+        
         self.mail_storage[current_count] = mail_id
-
+        self.top_mail_id = self.mail_storage[0]
+        
     def show_details(self, row, column):
         mail_id = self.mail_storage.get(row)
         self.manager_layout.setCurrentIndex(1)
@@ -203,37 +227,69 @@ class ComposeDialog(QDialog):
         self.accept()
 
 class MailWorker(QObject):
-    mail_loaded = pyqtSignal(int, str, str, str, str)
+    def __init__(self):
+        super().__init__()
+        self.top_mail_id = None
     
-            
+    mail_loaded = pyqtSignal(int, str, str, str, str)
+    finished = pyqtSignal() # new signal
+    
     def run(self):
-        with imaplib.IMAP4_SSL("imap.gmail.com") as mail_server:
-            mail_server.login(os.getenv("EMAIL_USER"), os.getenv("EMAIL_PASSWORD"))
-            mail_server.select("INBOX")
-            #search all mails
-            status, data = mail_server.search(None, "ALL")
-            mail_ids = data[0].split()
-            id_string = b",".join(mail_ids).decode()
-            
-            status, fetch_data = mail_server.fetch(id_string, "(RFC822.HEADER)")
-            reversed_data = reversed(fetch_data)
-            print(f'fetch_data: {fetch_data}')
-            
-            for item in reversed_data:
-                if isinstance(item, tuple):
-                    loaded_msg = email.message_from_bytes(item[1])
+        try:
+            with imaplib.IMAP4_SSL("imap.gmail.com") as mail_server:
+                mail_server.login(os.getenv("EMAIL_USER"), os.getenv("EMAIL_PASSWORD"))
+                mail_server.select("INBOX")
+                #search all mails
+                status, data = mail_server.search(None, "ALL")
+                mail_ids = data[0].split()
+                newest_mail_id = int(mail_ids[-1].decode())
+                if self.top_mail_id is None:
+                    print(f'initial load')
+                    target_ids = mail_ids[-15:]
+                    id_string = b",".join(target_ids).decode()
+                    status, fetch_data = mail_server.fetch(id_string, "(RFC822.HEADER)")    
+                    reversed_data = reversed(fetch_data)
                     
-                    loaded_sender = loaded_msg["From"]
-                    loaded_subject = loaded_msg["Subject"]
-                    loaded_date = loaded_msg["Date"]
+                    for item in reversed_data:
+                            if isinstance(item, tuple):
+                                loaded_msg = email.message_from_bytes(item[1])                    
+                                loaded_sender = loaded_msg["From"]
+                                loaded_subject = loaded_msg["Subject"]
+                                loaded_date = loaded_msg["Date"]
 
-                    formated_date = get_local_formated_date(loaded_date)
+                                formated_date = get_local_formated_date(loaded_date)
 
-                    msg_num = item[0].split()[0]
-                    mail_id_str = msg_num.decode()
-                    row_index = mail_ids.index(msg_num)
-                    self.mail_loaded.emit(row_index, loaded_sender, loaded_subject, formated_date, mail_id_str)
+                                msg_num = item[0].split()[0]
+                                mail_id_str = msg_num.decode()
+                                row_index = mail_ids.index(msg_num)
+                                self.mail_loaded.emit(row_index, loaded_sender, loaded_subject, formated_date, mail_id_str)
+                elif newest_mail_id > int(self.top_mail_id):
+                        print(f"Neue E-Mails gefunden! Neueste ID: {newest_mail_id}")
+                        new_ids = [mid for mid in mail_ids if int(mid) > int(self.top_mail_id)]
+                        id_string = b",".join(new_ids).decode()
+                        
+                        status, fetch_data = mail_server.fetch(id_string, "(RFC822.HEADER)")
+                        reversed_data = reversed(fetch_data)
+                        
+                        for item in reversed_data:
+                            if isinstance(item, tuple):
+                                loaded_msg = email.message_from_bytes(item[1])                    
+                                loaded_sender = loaded_msg["From"]
+                                loaded_subject = loaded_msg["Subject"]
+                                loaded_date = loaded_msg["Date"]
 
+                                formated_date = get_local_formated_date(loaded_date)
+
+                                msg_num = item[0].split()[0]
+                                mail_id_str = msg_num.decode()
+                                row_index = mail_ids.index(msg_num)
+                                self.mail_loaded.emit(row_index, loaded_sender, loaded_subject, formated_date, mail_id_str)
+                else:
+                    print("Keine neuen E-Mails.")
+        except Exception as e:
+                print(f"Fehler im MailWorker: {e}")
+        finally:
+            self.finished.emit()
 
         
 import signal
