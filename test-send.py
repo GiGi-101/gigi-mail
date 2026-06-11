@@ -1,24 +1,33 @@
-from smtplib import SMTP_SSL
 from email.message import EmailMessage
-import os
-from dotenv import load_dotenv
-load_dotenv()
+from smtplib import SMTP_SSL
 
-class mail():
+import credentials
+
+
+class mail:
     def __init__(self):
         super().__init__()
-    
-    def send(self):
-        msg = EmailMessage()
-        msg["Subject"] = "Test"
-        msg["From"] = "EMAIL_USER"
-        msg["To"] = "EMAIL_USER"
-        msg.set_content("Das ist ein Test")
-        
-        with SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(os.getenv("EMAIL_USER"), os.getenv("EMAIL_PASSWORD"))
-            server.send_message(msg)
-            
-my_client = mail()
 
+    def send(self):
+        email_user, email_password = credentials.get_credentials()
+        if not email_user or not email_password:
+            print("Error: No credentials stored in Keychain.")
+            return
+
+        msg = EmailMessage()
+        msg["Subject"] = "Test Secure Storage"
+        msg["From"] = email_user
+        msg["To"] = email_user
+        msg.set_content(
+            "Das ist ein Test über die sichere Schlüsselbund-Authentifizierung."
+        )
+
+        print(f"Sending test email from/to {email_user}...")
+        with SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(email_user, email_password)
+            server.send_message(msg)
+        print("Email sent successfully!")
+
+
+my_client = mail()
 my_client.send()

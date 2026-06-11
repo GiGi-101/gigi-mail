@@ -1,8 +1,9 @@
-import sys
-import os
+import imaplib
 import logging
-from dotenv import load_dotenv
-load_dotenv()
+import os
+import sys
+
+import credentials
 
 # Configure logging to write to both client.log and the console
 logging.basicConfig(
@@ -10,35 +11,41 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.FileHandler("client.log", encoding="utf-8"),
-        logging.StreamHandler(sys.stdout)
-    ]
+        logging.StreamHandler(sys.stdout),
+    ],
 )
 
-from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QStatusBar, QWidget, QHBoxLayout, 
-    QVBoxLayout, QListWidget, QTableWidget, QStackedWidget, QDialog, 
-    QLineEdit, QTextEdit, QPushButton, QTableWidgetItem, QLabel, QMessageBox,
-    QHeaderView, QAbstractItemView, QStyledItemDelegate, QStyle
-)
-from PyQt6.QtGui import QAction, QColor, QFont, QBrush, QPen, QCursor
-from PyQt6.QtCore import QTimer, QThread, Qt
-from PyQt6.QtWebEngineWidgets import QWebEngineView
 from smtplib import SMTP_SSL
 
-from helper import create_email, get_local_formated_date, extract_email_body, decode_imap_folder
+from PyQt6.QtCore import (QItemSelectionModel, QObject, Qt, QThread, QTimer,
+                          pyqtSignal)
+from PyQt6.QtGui import (QAction, QBrush, QColor, QCursor, QFont, QKeySequence,
+                         QPen, QShortcut)
+from PyQt6.QtWebEngineWidgets import QWebEngineView
+from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QDialog,
+                             QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+                             QListWidget, QMainWindow, QMenu, QMessageBox,
+                             QPushButton, QStackedWidget, QStatusBar, QStyle,
+                             QStyledItemDelegate, QTableWidget,
+                             QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget)
+
+from helper import (create_email, decode_imap_folder, extract_email_body,
+                    get_local_formated_date)
 from workers import MailContentWorker, MailWorker
+
 
 class HoverTableWidget(QTableWidget):
     """
     Custom QTableWidget that tracks mouse movements and updates the hovered row
     to trigger repaint of row cells for a custom hover effect.
     """
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.setMouseTracking(True)
         self.viewport().setAttribute(Qt.WidgetAttribute.WA_Hover, True)
         self.hovered_row = -1
-        
+
     def mouseMoveEvent(self, event):
         super().mouseMoveEvent(event)
         index = self.indexAt(event.position().toPoint())
@@ -47,54 +54,77 @@ class HoverTableWidget(QTableWidget):
             self.hovered_row = index.row()
         else:
             self.hovered_row = -1
-            
+
         if self.hovered_row != old_row:
             self.viewport().update()
-            
+
     def leaveEvent(self, event):
         super().leaveEvent(event)
         self.hovered_row = -1
         self.viewport().update()
+
+    def keyPressEvent(self, event):
+        """Open the selected email on Enter/Return; pass everything else through."""
+        key = event.key()
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            selected = self.selectedIndexes()
+            if selected:
+                row = selected[0].row()
+                # Fire the same signal as a mouse click so show_details is called
+                self.cellClicked.emit(row, selected[0].column())
+        else:
+            super().keyPressEvent(event)
+
 
 class HoverDelegate(QStyledItemDelegate):
     """
     Custom delegate to style cells of the currently hovered row and draw a
     mechanical neon pink border around the row.
     """
+
     def initStyleOption(self, option, index):
         super().initStyleOption(option, index)
         view = self.parent()
-        if hasattr(view, 'hovered_row') and view.hovered_row == index.row():
+        if hasattr(view, "hovered_row") and view.hovered_row == index.row():
             # Apply hover background and text color styling only if not selected
             if not (option.state & QStyle.StateFlag.State_Selected):
-                option.backgroundBrush = QBrush(QColor(255, 255, 255, 22))  # Translucent white
-                option.palette.setColor(option.palette.ColorGroup.All, option.palette.ColorRole.Text, QColor("#ff007f"))
-                option.palette.setColor(option.palette.ColorGroup.All, option.palette.ColorRole.HighlightedText, QColor("#ff007f"))
-            
+                option.backgroundBrush = QBrush(
+                    QColor(255, 255, 255, 22)
+                )  # Translucent white
+                option.palette.setColor(
+                    option.palette.ColorGroup.All,
+                    option.palette.ColorRole.Text,
+                    QColor("#ff007f"),
+                )
+                option.palette.setColor(
+                    option.palette.ColorGroup.All,
+                    option.palette.ColorRole.HighlightedText,
+                    QColor("#ff007f"),
+                )
+
     def paint(self, painter, option, index):
         super().paint(painter, option, index)
         view = self.parent()
-        if hasattr(view, 'hovered_row') and view.hovered_row == index.row():
+        if hasattr(view, "hovered_row") and view.hovered_row == index.row():
             painter.save()
             pen = QPen(QColor(255, 0, 127, 180), 1)  # Translucent neon pink border
             painter.setPen(pen)
-            
+
             rect = option.rect
-            
+
             # Draw top and bottom borders
             painter.drawLine(rect.left(), rect.top(), rect.right(), rect.top())
             painter.drawLine(rect.left(), rect.bottom(), rect.right(), rect.bottom())
-            
+
             # Draw left border for first column
             if index.column() == 0:
                 painter.drawLine(rect.left(), rect.top(), rect.left(), rect.bottom())
-            
+
             # Draw right border for last column
             if index.column() == index.model().columnCount() - 1:
                 painter.drawLine(rect.right(), rect.top(), rect.right(), rect.bottom())
-                
-            painter.restore()
 
+            painter.restore()
 
 
 # Premium "Miami Vice + NFS Underground" Neon QSS Stylesheet
@@ -283,8 +313,199 @@ QLineEdit:focus, QTextEdit:focus {
     border: 1px solid #ff007f;
     background-color: rgba(255, 255, 255, 0.05);
 }
+
+/* Context Menus */
+QMenu {
+    background-color: rgba(15, 8, 28, 0.95);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 12px;
+    padding: 6px 4px;
+    font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+    font-size: 14px;
+    color: rgba(255, 255, 255, 0.9);
+}
+QMenu::item {
+    padding: 9px 22px;
+    border-radius: 8px;
+    margin: 2px 4px;
+}
+QMenu::item:selected {
+    background-color: rgba(255, 0, 127, 0.25);
+    color: #ff007f;
+}
+QMenu::item:disabled {
+    color: rgba(255, 255, 255, 0.3);
+}
+QMenu::separator {
+    height: 1px;
+    background: rgba(255, 255, 255, 0.08);
+    margin: 4px 10px;
+}
+
+/* Menu Bar */
+QMenuBar {
+    background-color: rgba(255, 255, 255, 0.02);
+    color: rgba(255, 255, 255, 0.85);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+    font-size: 14px;
+    padding: 2px 4px;
+}
+QMenuBar::item {
+    padding: 6px 14px;
+    border-radius: 8px;
+    background: transparent;
+}
+QMenuBar::item:selected {
+    background-color: rgba(255, 255, 255, 0.08);
+    color: #ff007f;
+}
+QMenuBar::item:pressed {
+    background-color: rgba(255, 0, 127, 0.15);
+}
 """
 
+
+class IMAPAuthWorker(QObject):
+    """
+    Worker task to verify credentials by attempting to log in to GMail IMAP.
+    """
+
+    finished = pyqtSignal(bool, str)
+
+    def __init__(self, email_user, email_password):
+        super().__init__()
+        self.email_user = email_user
+        self.email_password = email_password
+
+    def run(self):
+        try:
+            with imaplib.IMAP4_SSL("imap.gmail.com") as server:
+                server.login(self.email_user, self.email_password)
+            self.finished.emit(True, "")
+        except Exception as e:
+            self.finished.emit(False, str(e))
+
+
+class CredentialsDialog(QDialog):
+    """
+    Setup dialog to enter and securely save email credentials to Keychain.
+    Uses liquid glass aesthetics matching the app style.
+    """
+
+    def __init__(self, parent=None, prefill_email=""):
+        super().__init__(parent)
+        self.setWindowTitle("SECURE STORAGE CONFIGURATION")
+        self.resize(550, 420)
+
+        dialog_layout = QVBoxLayout()
+        dialog_layout.setContentsMargins(32, 32, 32, 32)
+        dialog_layout.setSpacing(18)
+
+        # Header title
+        header_title = QLabel("KEYCHAIN CREDENTIAL SETUP")
+        header_title.setStyleSheet(
+            "font-size: 18px; color: #00f0ff; letter-spacing: 2px;"
+        )
+
+        desc = QLabel(
+            "Your credentials will be verified and stored securely in the native macOS Keychain."
+        )
+        desc.setStyleSheet(
+            "color: rgba(255, 255, 255, 0.65); font-size: 12px; font-weight: normal; text-transform: none; letter-spacing: 0px;"
+        )
+        desc.setWordWrap(True)
+
+        l1 = QLabel("> EMAIL ADDRESS")
+        self.email_input = QLineEdit(prefill_email)
+        self.email_input.setPlaceholderText("yourname@gmail.com")
+
+        l2 = QLabel("> APP PASSWORD / PASSWORD")
+        self.password_input = QLineEdit()
+        self.password_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.password_input.setPlaceholderText("Enter 16-character app password...")
+
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet(
+            "color: #ff007f; font-size: 13px; font-weight: normal; text-transform: none; letter-spacing: 0.5px;"
+        )
+        self.status_label.setWordWrap(True)
+
+        # Action buttons
+        button_layout = QHBoxLayout()
+        button_layout.setSpacing(16)
+        button_layout.addStretch()
+
+        self.cancel_btn = QPushButton("Abort")
+        self.cancel_btn.clicked.connect(self.reject)
+
+        self.save_btn = QPushButton("Save & Connect")
+        self.save_btn.clicked.connect(self.validate_and_save)
+
+        button_layout.addWidget(self.cancel_btn)
+        button_layout.addWidget(self.save_btn)
+
+        dialog_layout.addWidget(header_title)
+        dialog_layout.addWidget(desc)
+        dialog_layout.addWidget(l1)
+        dialog_layout.addWidget(self.email_input)
+        dialog_layout.addWidget(l2)
+        dialog_layout.addWidget(self.password_input)
+        dialog_layout.addWidget(self.status_label)
+        dialog_layout.addLayout(button_layout)
+
+        self.setLayout(dialog_layout)
+
+        self.auth_thread = None
+        self.auth_worker = None
+
+    def validate_and_save(self):
+        email_val = self.email_input.text().strip()
+        pwd_val = self.password_input.text().strip()
+
+        if not email_val or not pwd_val:
+            self.status_label.setText(
+                "Error: Email and password fields cannot be empty."
+            )
+            return
+
+        self.status_label.setText(
+            "⌛ Connecting to imap.gmail.com to verify credentials..."
+        )
+        self.email_input.setEnabled(False)
+        self.password_input.setEnabled(False)
+        self.save_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(False)
+
+        self.auth_thread = QThread()
+        self.auth_worker = IMAPAuthWorker(email_val, pwd_val)
+        self.auth_worker.moveToThread(self.auth_thread)
+
+        self.auth_thread.started.connect(self.auth_worker.run)
+        self.auth_worker.finished.connect(self.on_validation_result)
+
+        # Cleanup
+        self.auth_worker.finished.connect(self.auth_thread.quit)
+        self.auth_worker.finished.connect(self.auth_worker.deleteLater)
+        self.auth_thread.finished.connect(self.auth_thread.deleteLater)
+
+        self.auth_thread.start()
+
+    def on_validation_result(self, success, error_message):
+        self.email_input.setEnabled(True)
+        self.password_input.setEnabled(True)
+        self.save_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(True)
+
+        if success:
+            email_val = self.email_input.text().strip()
+            pwd_val = self.password_input.text().strip()
+            if credentials.set_credentials(email_val, pwd_val):
+                self.accept()
+            else:
+                self.status_label.setText("Error: Failed to save to macOS Keychain.")
+        else:
+            self.status_label.setText(f"Validation failed: {error_message}")
 
 
 class MainWindow(QMainWindow):
@@ -292,37 +513,40 @@ class MainWindow(QMainWindow):
     Main application window hosting folders list, emails overview table,
     and the webview for email details. Handles thread instantiation and QTimer polling.
     """
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("GiGi MAils")
         screen_geo = QApplication.primaryScreen().availableGeometry()
         self.resize(screen_geo.size())
-        
+
         # Apply the global stylesheet to the main window
         self.setStyleSheet(STYLESHEET)
-        
+
         # Track active folder name and mail storage dynamically
         self.current_folder = "Inbox"
-        self.folders_map = {}  # Maps readable folder names to raw IMAP modified UTF-7 names
+        self.folders_map = (
+            {}
+        )  # Maps readable folder names to raw IMAP modified UTF-7 names
         self.mail_storage = {}
         self.top_mail_id = None
         self.folders_loaded_once = False
-        
+
         # Track active background threads and workers to prevent overlaps and leaks
         self.active_threads = set()
         self.active_workers = set()
-        
+
         self.init_ui()
-        
+
     def init_ui(self):
         """Initializes the user interface and sets up the layout and polling timer."""
         # Set up a polling timer to check for updates every 10 seconds
         self.update_timer = QTimer(self)
         self.update_timer.timeout.connect(lambda: self.start_mail_loading(force=False))
         self.update_timer.start(10000)
-        
+
         self.setup_menu_bar()
-        
+
         # Main Layout
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
@@ -331,31 +555,91 @@ class MainWindow(QMainWindow):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
         main_widget.setLayout(main_layout)
-        
+
         self.setup_sidebar(main_layout)
         self.setup_content_pane(main_layout)
-        
+
         self.setStatusBar(QStatusBar(self))
         self.statusBar().showMessage("Bereit")
 
         # Start initial email and folder loading
         self.start_mail_loading(force=True)
 
+        # Register global keyboard shortcuts
+        self.setup_shortcuts()
+
+    def setup_shortcuts(self):
+        """
+        Registers application-wide keyboard shortcuts that are not bound
+        to a menu action (menu actions handle their own shortcuts via setShortcut).
+        """
+        # Escape: navigate back from detail view to overview
+        esc = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
+        esc.activated.connect(self.back_to_overview)
+
+        # Ctrl+D: jump focus to the folder sidebar
+        focus_folders = QShortcut(QKeySequence("Ctrl+D"), self)
+        focus_folders.activated.connect(self.list_widget.setFocus)
+
+        # Ctrl+L: jump focus to the email list
+        focus_list = QShortcut(QKeySequence("Ctrl+L"), self)
+        focus_list.activated.connect(self.overview.setFocus)
+
     def setup_menu_bar(self):
         """Sets up the top menu bar actions and hotkeys."""
         menu_bar = self.menuBar()
-        file_menu = menu_bar.addMenu("File")
-        
-        exit_action = QAction("Close the awesome client", self)
+
+        # ── Mail Menu ──────────────────────────────────────────────────────────
+        mail_menu = menu_bar.addMenu("Mail")
+
+        new_mail_action = QAction("New Mail", self)
+        new_mail_action.setShortcut("Ctrl+N")
+        new_mail_action.setStatusTip("Neue E-Mail verfassen")
+        new_mail_action.triggered.connect(self.open_compose_dialog)
+        mail_menu.addAction(new_mail_action)
+
+        refresh_action = QAction("Refresh", self)
+        refresh_action.setShortcut("Ctrl+R")
+        refresh_action.setStatusTip("Postfach aktualisieren")
+        refresh_action.triggered.connect(lambda: self.start_mail_loading(force=True))
+        mail_menu.addAction(refresh_action)
+
+        config_action = QAction("Credentials...", self)
+        config_action.setStatusTip("Zugangsdaten verwalten")
+        config_action.triggered.connect(self.open_credentials_dialog)
+        mail_menu.addAction(config_action)
+
+        logout_action = QAction("Logout", self)
+        logout_action.setStatusTip(
+            "Ausloggen und Zugangsdaten aus dem Schlüsselbund löschen"
+        )
+        logout_action.triggered.connect(self.logout)
+        mail_menu.addAction(logout_action)
+
+        mail_menu.addSeparator()
+
+        exit_action = QAction("Quit", self)
         exit_action.setShortcut("Ctrl+Q")
         exit_action.setStatusTip("Anwendung schließen")
         exit_action.triggered.connect(self.close)
-        
-        new_mail_action = QAction("New Mail", self)
-        new_mail_action.triggered.connect(self.open_compose_dialog)
-        
-        file_menu.addAction(exit_action)
-        file_menu.addAction(new_mail_action)
+        mail_menu.addAction(exit_action)
+
+        # ── View Menu ──────────────────────────────────────────────────────────
+        view_menu = menu_bar.addMenu("View")
+
+        refresh_folders_action = QAction("Refresh Folders", self)
+        refresh_folders_action.setShortcut("Ctrl+Shift+R")
+        refresh_folders_action.setStatusTip("Ordnerliste neu laden")
+        refresh_folders_action.triggered.connect(self.refresh_folders)
+        view_menu.addAction(refresh_folders_action)
+
+        # ── Help Menu ──────────────────────────────────────────────────────────
+        help_menu = menu_bar.addMenu("Help")
+
+        about_action = QAction("About GiGi Mails", self)
+        about_action.setStatusTip("Über diese Anwendung")
+        about_action.triggered.connect(self.show_about)
+        help_menu.addAction(about_action)
 
     def setup_sidebar(self, parent_layout):
         """Sets up the mailbox folder list widget on the left sidebar."""
@@ -364,11 +648,16 @@ class MainWindow(QMainWindow):
         self.list_widget.addItem("Inbox")
         self.list_widget.addItem("Sent")
         self.list_widget.currentTextChanged.connect(self.on_folder_changed)
+        # Enable right-click context menu on the sidebar
+        self.list_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.list_widget.customContextMenuRequested.connect(
+            self.show_folder_context_menu
+        )
 
     def setup_content_pane(self, parent_layout):
         """Sets up the right main pane with the stacked layout (overview & details)."""
         self.manager_layout = QStackedWidget()
-        
+
         # Page 1: Overview
         self.page_overview = QWidget()
         self.page_overview_layout = QVBoxLayout()
@@ -376,37 +665,38 @@ class MainWindow(QMainWindow):
         self.page_overview_layout.setContentsMargins(15, 15, 15, 15)
         self.page_overview_layout.setSpacing(10)
         self.page_overview.setLayout(self.page_overview_layout)
-        
+
         self.setup_overview_table()
-        
+
         # Page 2: Details
         self.page_details = QWidget()
         self.page_details_layout = QVBoxLayout()
         self.page_details_layout.setContentsMargins(15, 15, 15, 15)
         self.page_details_layout.setSpacing(10)
         self.page_details.setLayout(self.page_details_layout)
-        
+
         self.details = QWebEngineView()
         self.details.setMinimumHeight(400)
         self.back_button = QPushButton("Back")
         self.back_button.clicked.connect(self.back_to_overview)
-        
+
         # Back button wrapper layout to align left
         button_layout = QHBoxLayout()
         button_layout.addWidget(self.back_button)
         button_layout.addStretch()
-        
+
         self.page_details_layout.addLayout(button_layout)
         self.page_details_layout.addWidget(self.details)
-        
+
         # Add to manager
         self.manager_layout.addWidget(self.page_overview)
         self.manager_layout.addWidget(self.page_details)
-        
+
         content_layout = QVBoxLayout()
         content_layout.addWidget(self.manager_layout)
-        parent_layout.addLayout(content_layout, 4)  # Stretch factor 4 (ratio 1:4 with sidebar)
-
+        parent_layout.addLayout(
+            content_layout, 4
+        )  # Stretch factor 4 (ratio 1:4 with sidebar)
 
     def setup_overview_table(self):
         """Sets up the table widget showing list of mails with modern grid options."""
@@ -414,48 +704,215 @@ class MainWindow(QMainWindow):
         self.overview.setColumnCount(3)
         self.overview.setHorizontalHeaderLabels(["Sender", "Subject", "Date Received"])
         self.overview.setRowCount(0)
-        
+
         # Hide the vertical row headers (numbers)
         self.overview.verticalHeader().setVisible(False)
-        
+
         # Select entire rows, not individual cells
-        self.overview.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.overview.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
         self.overview.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        
+
         # Disable editing of cells
         self.overview.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        
+
         # Configure columns stretch ratios
         header = self.overview.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)          # Stretch Subject to take remaining space
+        header.setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch
+        )  # Stretch Subject to take remaining space
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
-        
+
         # Initial default widths for columns
         self.overview.setColumnWidth(0, 240)
         self.overview.setColumnWidth(2, 200)
-        
+
         # Set modern spacious row and header heights
         self.overview.verticalHeader().setDefaultSectionSize(55)
         self.overview.horizontalHeader().setMinimumHeight(50)
-        
+
         # Alternating row colors for clean grid view
         self.overview.setAlternatingRowColors(True)
-        
+
         self.overview.cellClicked.connect(self.show_details)
-        
+
         # Set our custom hover delegate
         self.overview.setItemDelegate(HoverDelegate(self.overview))
-        
+
+        # Enable right-click context menu on the email table
+        self.overview.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.overview.customContextMenuRequested.connect(self.show_mail_context_menu)
+
         self.page_overview_layout.addWidget(self.overview)
 
-
-    def open_compose_dialog(self):
+    def open_compose_dialog(
+        self, _checked=False, prefill_receiver="", prefill_subject="", prefill_body=""
+    ):
         """
         Opens the modal dialog to compose and send a new email.
+        Accepts optional prefill values for reply/forward workflows.
         """
-        dialog = ComposeDialog()
+        dialog = ComposeDialog(
+            prefill_receiver=prefill_receiver,
+            prefill_subject=prefill_subject,
+            prefill_body=prefill_body,
+        )
         dialog.exec()
+
+    def open_credentials_dialog(self):
+        """
+        Opens the setup dialog to manage and update credentials.
+        Prefills the current email from secure storage.
+        """
+        current_email, _ = credentials.get_credentials()
+        dialog = CredentialsDialog(self, prefill_email=current_email or "")
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.statusBar().showMessage(
+                "Zugangsdaten erfolgreich aktualisiert. Aktualisiere Mailbox...", 5000
+            )
+            self.folders_loaded_once = False
+            self.start_mail_loading(force=True)
+
+    def logout(self):
+        """
+        Clears the stored credentials from Keychain, alerts the user,
+        and prompts for new credentials. Exits if the user aborts.
+        """
+        credentials.clear_credentials()
+        self.statusBar().showMessage(
+            "Erfolgreich abgemeldet. Bitte neu einloggen...", 5000
+        )
+
+        # Stop background timers
+        self.update_timer.stop()
+
+        dialog = CredentialsDialog(self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.folders_loaded_once = False
+            self.overview.setRowCount(0)
+            self.mail_storage = {}
+            self.top_mail_id = None
+            self.update_timer.start(10000)
+            self.start_mail_loading(force=True)
+        else:
+            sys.exit(0)
+
+    def handle_invalid_credentials(self):
+        """
+        Prompts the user to update their credentials when background workers
+        fail to authenticate with the server. Clears invalid entries and prompts.
+        """
+        # Stop background timers to prevent cascading connection failures
+        self.update_timer.stop()
+
+        # Clear the bad credentials from Keychain
+        credentials.clear_credentials()
+
+        QMessageBox.warning(
+            self,
+            "Authentifizierungsfehler",
+            "Ihre gespeicherten Zugangsdaten sind ungültig oder abgelaufen.\nBitte geben Sie Ihre Daten erneut ein.",
+        )
+
+        dialog = CredentialsDialog(self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.folders_loaded_once = False
+            self.overview.setRowCount(0)
+            self.mail_storage = {}
+            self.top_mail_id = None
+            self.update_timer.start(10000)
+            self.start_mail_loading(force=True)
+        else:
+            sys.exit(0)
+
+    # ── Context Menu Handlers ──────────────────────────────────────────────────
+
+    def show_mail_context_menu(self, position):
+        """Shows a context menu when right-clicking an email row in the overview table."""
+        index = self.overview.indexAt(position)
+        if not index.isValid():
+            return
+
+        row = index.row()
+        mail_id = self.mail_storage.get(row)
+        sender_item = self.overview.item(row, 0)
+        subject_item = self.overview.item(row, 1)
+        sender_text = sender_item.text() if sender_item else ""
+        subject_text = subject_item.text() if subject_item else ""
+
+        menu = QMenu(self)
+
+        open_action = QAction("Open", self)
+        open_action.triggered.connect(lambda: self.show_details(row, 0))
+        menu.addAction(open_action)
+
+        menu.addSeparator()
+
+        reply_action = QAction("Reply", self)
+        reply_action.triggered.connect(
+            lambda: self.open_compose_dialog(
+                prefill_receiver=sender_text,
+                prefill_subject=f"Re: {subject_text}",
+            )
+        )
+        menu.addAction(reply_action)
+
+        forward_action = QAction("Forward", self)
+        forward_action.triggered.connect(
+            lambda: self.open_compose_dialog(
+                prefill_subject=f"Fwd: {subject_text}",
+            )
+        )
+        menu.addAction(forward_action)
+
+        menu.addSeparator()
+
+        copy_sender_action = QAction("Copy Sender Address", self)
+        copy_sender_action.triggered.connect(
+            lambda: QApplication.clipboard().setText(sender_text)
+        )
+        menu.addAction(copy_sender_action)
+
+        menu.exec(self.overview.viewport().mapToGlobal(position))
+
+    def show_folder_context_menu(self, position):
+        """Shows a context menu when right-clicking a folder in the sidebar."""
+        menu = QMenu(self)
+
+        refresh_folder_action = QAction("Refresh Folder", self)
+        refresh_folder_action.triggered.connect(
+            lambda: self.start_mail_loading(force=True)
+        )
+        menu.addAction(refresh_folder_action)
+
+        refresh_all_action = QAction("Refresh All Folders", self)
+        refresh_all_action.triggered.connect(self.refresh_folders)
+        menu.addAction(refresh_all_action)
+
+        menu.addSeparator()
+
+        new_mail_action = QAction("New Mail", self)
+        new_mail_action.triggered.connect(self.open_compose_dialog)
+        menu.addAction(new_mail_action)
+
+        menu.exec(self.list_widget.mapToGlobal(position))
+
+    # ── Menu Action Helpers ────────────────────────────────────────────────────
+
+    def refresh_folders(self):
+        """Forces a full folder list reload from the server."""
+        self.folders_loaded_once = False
+        self.start_mail_loading(force=True)
+
+    def show_about(self):
+        """Shows a simple About dialog."""
+        QMessageBox.information(
+            self,
+            "About GiGi Mails",
+            "GiGi Mails\nVersion 1.0\n\nA premium PyQt6 email client\nwith a Miami Vice × NFS liquid glass aesthetic.",
+        )
 
     def populate_folders(self, folders):
         """
@@ -466,26 +923,27 @@ class MainWindow(QMainWindow):
         self.list_widget.blockSignals(True)
         self.list_widget.clear()
         self.folders_map.clear()
-        
+
         for raw_folder in folders:
             readable_name = decode_imap_folder(raw_folder)
             self.folders_map[readable_name] = raw_folder
             self.list_widget.addItem(readable_name)
-            
+
         # Find and re-select the currently active folder visually in the list
         readable_current = "Inbox"
         for readable, raw in self.folders_map.items():
             if raw == self.current_folder:
                 readable_current = readable
                 break
-                
+
         for index in range(self.list_widget.count()):
             item = self.list_widget.item(index)
             if item.text() == readable_current:
                 self.list_widget.setCurrentItem(item)
                 break
-                
+
         self.list_widget.blockSignals(False)
+
     def start_mail_loading(self, force=False):
         """
         Launches the background worker to load or update emails for the active folder.
@@ -493,15 +951,17 @@ class MainWindow(QMainWindow):
         """
         # Clean up already finished threads from our tracking set
         self.active_threads = {t for t in self.active_threads if t.isRunning()}
-        
+
         # Check if any loading thread is currently running
         if not force and self.active_threads:
             logging.info("Ladevorgang läuft noch, überspringe dieses Intervall.")
             return
-            
+
         # If forcing (e.g. folder changed), disconnect active workers from UI callbacks
         if force and self.active_threads:
-            logging.info("Anderer Ordner gewählt, trenne Signale der laufenden Hintergrund-Worker.")
+            logging.info(
+                "Anderer Ordner gewählt, trenne Signale der laufenden Hintergrund-Worker."
+            )
             for active_worker in list(self.active_workers):
                 try:
                     active_worker.mail_loaded.disconnect(self.on_mail_loaded)
@@ -515,34 +975,36 @@ class MainWindow(QMainWindow):
                     active_worker.error_occurred.disconnect(self.on_worker_error)
                 except (TypeError, AttributeError):
                     pass
-        
+
         # Determine loading state (First start vs Update check)
-        self.is_updating = getattr(self, 'top_mail_id', None) is not None
-        
+        self.is_updating = getattr(self, "top_mail_id", None) is not None
+
         thread = QThread()
-        worker = MailWorker(self.current_folder, load_folders=not self.folders_loaded_once)
-        worker.top_mail_id = getattr(self, 'top_mail_id', None)
+        worker = MailWorker(
+            self.current_folder, load_folders=not self.folders_loaded_once
+        )
+        worker.top_mail_id = getattr(self, "top_mail_id", None)
         worker.moveToThread(thread)
-        
+
         self.active_threads.add(thread)
         self.active_workers.add(worker)
-        
+
         thread.started.connect(worker.run)
         worker.mail_loaded.connect(self.on_mail_loaded)
         worker.error_occurred.connect(self.on_worker_error)
-        
+
         # Connect dynamic folder listing only once on startup
         if not self.is_updating:
             worker.folders_loaded.connect(self.populate_folders)
-        
+
         # Thread/Worker lifetime management to prevent memory leaks
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
         worker.finished.connect(lambda w=worker: self.active_workers.discard(w))
-        
+
         thread.finished.connect(thread.deleteLater)
         thread.finished.connect(lambda t=thread: self.active_threads.discard(t))
-        
+
         thread.start()
 
     def on_mail_loaded(self, row, sender, subject, date, mail_id, is_read):
@@ -560,29 +1022,28 @@ class MainWindow(QMainWindow):
         else:
             # Initial loading: Append emails chronologically to the end of the table
             target_row = self.overview.rowCount()
-            
+
         current_count = target_row
         self.overview.insertRow(current_count)
-        
+
         sender_item = QTableWidgetItem(sender)
         subject_item = QTableWidgetItem(subject)
         date_item = QTableWidgetItem(date)
-        
+
         if not is_read:
             bold_font = QFont()
             bold_font.setBold(True)
             sender_item.setFont(bold_font)
             subject_item.setFont(bold_font)
             date_item.setFont(bold_font)
-            
+
         self.overview.setItem(current_count, 0, sender_item)
         self.overview.setItem(current_count, 1, subject_item)
         self.overview.setItem(current_count, 2, date_item)
-        
+
         self.mail_storage[current_count] = mail_id
         self.top_mail_id = self.mail_storage[0]
 
-        
     def show_details(self, row, column):
         """
         Transitions UI to details view and spawns MailContentWorker to load email body.
@@ -595,7 +1056,10 @@ class MainWindow(QMainWindow):
         self.details.setHtml("<h3>⏳ Lade E-Mail-Inhalt...</h3>")
 
         # Disconnect previous content worker signals if still running to avoid UI display overlaps
-        if getattr(self, 'content_thread', None) is not None and self.content_thread.isRunning():
+        if (
+            getattr(self, "content_thread", None) is not None
+            and self.content_thread.isRunning()
+        ):
             try:
                 self.content_worker.content_loaded.disconnect(self.display_content)
             except (TypeError, AttributeError):
@@ -604,43 +1068,64 @@ class MainWindow(QMainWindow):
         # Protect content worker/thread from garbage collection by adding them to the tracking sets
         self.content_worker = MailContentWorker(mail_id, self.current_folder)
         self.content_thread = QThread()
-        
+
         self.content_worker.moveToThread(self.content_thread)
         self.active_threads.add(self.content_thread)
         self.active_workers.add(self.content_worker)
-        
+
         self.content_thread.started.connect(self.content_worker.run)
-        self.content_worker.content_loaded.connect(self.display_content) 
-        
+        self.content_worker.content_loaded.connect(self.display_content)
+
         self.content_worker.content_loaded.connect(self.content_thread.quit)
         self.content_worker.content_loaded.connect(self.content_worker.deleteLater)
-        self.content_worker.content_loaded.connect(lambda *args, w=self.content_worker: self.active_workers.discard(w))
-        
+        self.content_worker.content_loaded.connect(
+            lambda *args, w=self.content_worker: self.active_workers.discard(w)
+        )
+
         self.content_thread.finished.connect(self.content_thread.deleteLater)
-        self.content_thread.finished.connect(lambda *args, t=self.content_thread: self.active_threads.discard(t))
-        self.content_thread.finished.connect(lambda: setattr(self, 'content_thread', None))
-        self.content_thread.finished.connect(lambda: setattr(self, 'content_worker', None))
+        self.content_thread.finished.connect(
+            lambda *args, t=self.content_thread: self.active_threads.discard(t)
+        )
+        self.content_thread.finished.connect(
+            lambda: setattr(self, "content_thread", None)
+        )
+        self.content_thread.finished.connect(
+            lambda: setattr(self, "content_worker", None)
+        )
 
         self.content_thread.start()
 
     def display_content(self, html_content):
         self.details.setHtml(html_content)
-        
+
     def on_worker_error(self, message):
-        """Displays error messages in the status bar."""
+        """Displays error messages in the status bar. Auto-prompts if auth fails."""
         logging.error(f"Worker-Fehler gemeldet: {message}")
-        self.statusBar().showMessage(f"Fehler: {message}", 5000)
-    
+
+        # Check if this error is due to bad credentials/auth failure
+        if (
+            "authenticationfailed" in message.lower()
+            or "login failed" in message.lower()
+            or "username or password" in message.lower()
+        ):
+            self.statusBar().showMessage(
+                "Fehler: Ungültige Zugangsdaten! Bitte neu anmelden.", 5000
+            )
+            # Use QTimer to pop up the dialog after the current worker finishes clean up
+            QTimer.singleShot(100, self.handle_invalid_credentials)
+        else:
+            self.statusBar().showMessage(f"Fehler: {message}", 5000)
+
     def back_to_overview(self):
         self.manager_layout.setCurrentIndex(0)
-    
+
     def on_folder_changed(self, folder_name):
         """
         Resets data storage and launches a reload operation when another folder is selected.
         """
         if not folder_name:
             return
-        
+
         logging.info(f"Ordnerwechsel zu: {folder_name}")
         self.overview.setRowCount(0)
         self.mail_storage = {}
@@ -648,50 +1133,57 @@ class MainWindow(QMainWindow):
         # Retrieve the raw IMAP UTF-7 name from our mapping dictionary
         self.current_folder = self.folders_map.get(folder_name, folder_name)
         self.start_mail_loading(force=True)
-        
+
+
 class ComposeDialog(QDialog):
     """
     Modal window dialog to compose a new email message.
+    Accepts optional prefill values for reply/forward workflows.
     """
-    def __init__(self):
+
+    def __init__(self, prefill_receiver="", prefill_subject="", prefill_body=""):
         super().__init__()
         self.setWindowTitle("NEW TRANSMISSION // COMPOSE MAIL")
         self.resize(650, 750)
-        
+
         dialog_layout = QVBoxLayout()
         dialog_layout.setContentsMargins(32, 32, 32, 32)
         dialog_layout.setSpacing(18)
-        
+
         # Header title
         header_title = QLabel("CREATE NEW TRANSMISSION")
-        header_title.setStyleSheet("font-size: 18px; color: #00f0ff; letter-spacing: 2px;")
-        
+        header_title.setStyleSheet(
+            "font-size: 18px; color: #00f0ff; letter-spacing: 2px;"
+        )
+
         l1 = QLabel("> RECEIVER")
-        self.receiver = QLineEdit("joners.guenther@gmail.com")
+        self.receiver = QLineEdit(prefill_receiver)
         self.receiver.setPlaceholderText("Enter receiver email address...")
-        
+
         l2 = QLabel("> SUBJECT")
-        self.subject = QLineEdit()
+        self.subject = QLineEdit(prefill_subject)
         self.subject.setPlaceholderText("Enter transmission subject...")
-        
+
         l3 = QLabel("> MESSAGE BODY")
         self.text = QTextEdit()
+        if prefill_body:
+            self.text.setPlainText(prefill_body)
         self.text.setPlaceholderText("Type your message here...")
-        
+
         # Cancel and Send buttons aligned in a modern row layout
         button_layout = QHBoxLayout()
         button_layout.setSpacing(16)
         button_layout.addStretch()
-        
+
         cancel_button = QPushButton("Abort")
         cancel_button.clicked.connect(self.reject)
-        
+
         self.send_button = QPushButton("Transmit")
         self.send_button.clicked.connect(self.send_mail)
-        
+
         button_layout.addWidget(cancel_button)
         button_layout.addWidget(self.send_button)
-        
+
         dialog_layout.addWidget(header_title)
         dialog_layout.addWidget(l1)
         dialog_layout.addWidget(self.receiver)
@@ -700,30 +1192,50 @@ class ComposeDialog(QDialog):
         dialog_layout.addWidget(l3)
         dialog_layout.addWidget(self.text)
         dialog_layout.addLayout(button_layout)
-        
+
         self.setLayout(dialog_layout)
-        
+
     def send_mail(self):
         """
         Constructs the EmailMessage and sends it using SMTP_SSL.
         """
-        msg = create_email(os.getenv("EMAIL_USER"), self.receiver.text(), self.subject.text(), self.text.toPlainText())
-        
+        email_user, email_password = credentials.get_credentials()
+        msg = create_email(
+            email_user,
+            self.receiver.text(),
+            self.subject.text(),
+            self.text.toPlainText(),
+        )
+
         try:
             with SMTP_SSL("smtp.gmail.com", 465) as server:
-                server.login(os.getenv("EMAIL_USER"), os.getenv("EMAIL_PASSWORD"))
+                server.login(email_user, email_password)
                 server.send_message(msg)
-                self.accept() 
+                self.accept()
         except Exception as e:
-            QMessageBox.critical(self, "Fehler beim Senden", f"Die E-Mail konnte nicht gesendet werden:\n{e}")
+            QMessageBox.critical(
+                self,
+                "Fehler beim Senden",
+                f"Die E-Mail konnte nicht gesendet werden:\n{e}",
+            )
             logging.error(f"Error while sending email: {e}", exc_info=True)
+
 
 if __name__ == "__main__":
     import signal
+
     # Enable Ctrl+C in terminal to terminate the application immediately
     signal.signal(signal.SIGINT, signal.SIG_DFL)
-    
+
     app = QApplication(sys.argv)
+
+    # Check credentials on startup; prompt user if not set
+    email_user, email_password = credentials.get_credentials()
+    if not email_user or not email_password:
+        dialog = CredentialsDialog()
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            sys.exit(0)
+
     window = MainWindow()
     window.show()
     app.exec()
