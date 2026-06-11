@@ -6,7 +6,7 @@ load_dotenv()
 import imaplib
 import email
 
-from PyQt6.QtWidgets import QApplication, QMainWindow, QStatusBar, QWidget, QHBoxLayout, QVBoxLayout, QListWidget, QTableWidget, QStackedWidget, QDialog, QLineEdit, QTextEdit, QPushButton, QTableWidgetItem
+from PyQt6.QtWidgets import QApplication, QMainWindow, QStatusBar, QWidget, QHBoxLayout, QVBoxLayout, QListWidget, QTableWidget, QStackedWidget, QDialog, QLineEdit, QTextEdit, QPushButton, QTableWidgetItem, QLabel
 from PyQt6.QtGui import QAction
 from PyQt6.QtCore import QThread, QObject, pyqtSignal
 from PyQt6.QtWebEngineWidgets import QWebEngineView
@@ -14,7 +14,8 @@ from smtplib import SMTP_SSL
 
 from email.message import EmailMessage
 from email.utils import parsedate_to_datetime
-import re
+
+from helper import create_email, get_local_formated_date, extract_email_body
 
 class MailContentWorker(QObject):
     # send html to MainWindow 
@@ -34,17 +35,7 @@ class MailContentWorker(QObject):
 
                 loaded_msg = email.message_from_bytes(mail_data[0][1])
 
-                content = ""
-                if loaded_msg.is_multipart():
-                    for part in loaded_msg.walk():
-                        if part.get_content_type() == "text/html":
-                            content = part.get_payload(decode=True).decode(errors="ignore")
-                            break
-                else:
-                    content = loaded_msg.get_payload(decode=True).decode(errors="ignore")
-                
-                if not content:
-                    content = loaded_msg.get_payload(decode=True).decode(errors="ignore")
+                content = extract_email_body(loaded_msg)
 
                 self.content_loaded.emit(content)
 
@@ -111,7 +102,7 @@ class MainWindow(QMainWindow):
         self.overview = QTableWidget()
         self.overview.setColumnCount(3)
         self.overview.setHorizontalHeaderLabels(["Sender", "Subject", "Date Received"])
-        self.overview.setRowCount(29)
+        self.overview.setRowCount(0)
         self.page_overview_layout.addWidget(self.overview)
 
         #mail content
@@ -140,10 +131,12 @@ class MainWindow(QMainWindow):
         self.loading_thread.start()
 
     def on_mail_loaded(self, row, sender, subject, date, mail_id):
-        self.overview.setItem(row, 0, QTableWidgetItem(sender))
-        self.overview.setItem(row, 1, QTableWidgetItem(subject))
-        self.overview.setItem(row, 2, QTableWidgetItem(date))
-        self.mail_storage[row] = mail_id
+        current_count = self.overview.rowCount()
+        self.overview.insertRow(current_count)
+        self.overview.setItem(current_count, 0, QTableWidgetItem(sender))
+        self.overview.setItem(current_count, 1, QTableWidgetItem(subject))
+        self.overview.setItem(current_count, 2, QTableWidgetItem(date))
+        self.mail_storage[current_count] = mail_id
 
     def show_details(self, row, column):
         mail_id = self.mail_storage.get(row)
@@ -177,24 +170,31 @@ class ComposeDialog(QDialog):
     def __init__(self):
         super().__init__()
         dialog_layout = QVBoxLayout()
-        self.setLayout(dialog_layout)
+        l1 = QLabel()
+        l2 = QLabel()
+        l3 = QLabel()
+        l4 = QLabel()
         
-        self.receiver = QLineEdit()
+        self.setLayout(dialog_layout)
+        l1.setText("Receiver:")
+        self.receiver = QLineEdit("joners.guenther@gmail.com")
+        l2.setText("Subject:")
         self.subject = QLineEdit()
+        l3.setText("Body:")
         self.text = QTextEdit()
         self.send_button = QPushButton("Send")
         self.send_button.clicked.connect(self.send_mail)
+        dialog_layout.addWidget(l1)
         dialog_layout.addWidget(self.receiver)
+        dialog_layout.addWidget(l2)
         dialog_layout.addWidget(self.subject)
+        dialog_layout.addWidget(l3)
         dialog_layout.addWidget(self.text)
         dialog_layout.addWidget(self.send_button)
         
+        
     def send_mail(self):
-        msg = EmailMessage()
-        msg["Subject"] = self.subject.text()
-        msg["From"] = os.getenv("EMAIL_USER")
-        msg["To"] = self.receiver.text()
-        msg.set_content(self.text.toPlainText())
+        msg =  create_email(os.getenv("EMAIL_USER"),self.receiver.text(),self.subject.text(),self.text.toPlainText()) #sender, receiver, subject, body
         
         with SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(os.getenv("EMAIL_USER"), os.getenv("EMAIL_PASSWORD"))
@@ -205,19 +205,6 @@ class ComposeDialog(QDialog):
 class MailWorker(QObject):
     mail_loaded = pyqtSignal(int, str, str, str, str)
     
-    def get_local_formated_date(self, date_str):
-        if not date_str:
-            return None
-        
-        cleaned_str = re.sub(r'^[^0-9]*', '', date_str)
-        
-        try:
-            dt = parsedate_to_datetime(cleaned_str)
-            dt_local = dt.astimezone()
-            return dt_local.strftime("%H:%M:%S %d.%m.%y")
-        except Exception as e:
-            print(f'Error while formatting date str: {date_str} with error: {e}')
-            return None
             
     def run(self):
         with imaplib.IMAP4_SSL("imap.gmail.com") as mail_server:
@@ -226,12 +213,13 @@ class MailWorker(QObject):
             #search all mails
             status, data = mail_server.search(None, "ALL")
             mail_ids = data[0].split()
-            mail_ids.reverse()
             id_string = b",".join(mail_ids).decode()
             
             status, fetch_data = mail_server.fetch(id_string, "(RFC822.HEADER)")
-
-            for item in fetch_data:
+            reversed_data = reversed(fetch_data)
+            print(f'fetch_data: {fetch_data}')
+            
+            for item in reversed_data:
                 if isinstance(item, tuple):
                     loaded_msg = email.message_from_bytes(item[1])
                     
@@ -239,7 +227,7 @@ class MailWorker(QObject):
                     loaded_subject = loaded_msg["Subject"]
                     loaded_date = loaded_msg["Date"]
 
-                    formated_date = self.get_local_formated_date(loaded_date)
+                    formated_date = get_local_formated_date(loaded_date)
 
                     msg_num = item[0].split()[0]
                     mail_id_str = msg_num.decode()
@@ -248,6 +236,10 @@ class MailWorker(QObject):
 
 
         
+import signal
+# Enable Ctrl+C in terminal to terminate the application immediately
+signal.signal(signal.SIGINT, signal.SIG_DFL)
+
 app = QApplication(sys.argv)
 
 window = MainWindow()
