@@ -1,6 +1,5 @@
 import sys
 import os
-import time
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -12,7 +11,10 @@ from PyQt6.QtGui import QAction
 from PyQt6.QtCore import QThread, QObject, pyqtSignal
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from smtplib import SMTP_SSL
+
 from email.message import EmailMessage
+from email.utils import parsedate_to_datetime
+import re
 
 class MailContentWorker(QObject):
     # send html to MainWindow 
@@ -80,7 +82,6 @@ class MainWindow(QMainWindow):
         main_layout = QHBoxLayout()
         main_widget.setLayout(main_layout)
         
-        #left row
         self.list_widget = QListWidget()
         main_layout.addWidget(self.list_widget)
         
@@ -108,16 +109,14 @@ class MainWindow(QMainWindow):
         content_layout = QVBoxLayout()
         content_layout.addWidget(self.manager_layout)
         self.overview = QTableWidget()
-        self.overview.setColumnCount(2)
-        self.overview.setHorizontalHeaderLabels(["Sender", "Subject"])
+        self.overview.setColumnCount(3)
+        self.overview.setHorizontalHeaderLabels(["Sender", "Subject", "Date Received"])
         self.overview.setRowCount(29)
         self.page_overview_layout.addWidget(self.overview)
 
         #mail content
 
         self.overview.cellClicked.connect(self.show_details)
-        #content_layout.addWidget(self.overview)
-        #content_layout.addWidget(self.details)
         
         main_layout.addLayout(content_layout)
         
@@ -140,9 +139,10 @@ class MainWindow(QMainWindow):
         mail_loaded = self.worker.mail_loaded.connect(self.on_mail_loaded)
         self.loading_thread.start()
 
-    def on_mail_loaded(self, row, sender, subject, mail_id):
+    def on_mail_loaded(self, row, sender, subject, date, mail_id):
         self.overview.setItem(row, 0, QTableWidgetItem(sender))
         self.overview.setItem(row, 1, QTableWidgetItem(subject))
+        self.overview.setItem(row, 2, QTableWidgetItem(date))
         self.mail_storage[row] = mail_id
 
     def show_details(self, row, column):
@@ -153,25 +153,20 @@ class MainWindow(QMainWindow):
 
         self.details.setHtml("<h3>⏳ Lade E-Mail-Inhalt...</h3>")
 
-        # 1. Den Spezial-Worker erstellen und ihm die ID geben
         self.content_worker = MailContentWorker(mail_id)
         self.content_thread = QThread()
         
         self.content_worker.moveToThread(self.content_thread)
         
-        # 2. Signale verknüpfen
         self.content_thread.started.connect(self.content_worker.run)
-        # Wenn der Text da ist, werfen wir ihn in eine neue Methode "display_content"
         self.content_worker.content_loaded.connect(self.display_content) 
         
         self.content_worker.content_loaded.connect(self.content_thread.quit)
         self.content_worker.content_loaded.connect(self.content_worker.deleteLater)
         self.content_thread.finished.connect(self.content_thread.deleteLater)
 
-        # 3. Worker starten
         self.content_thread.start()
 
-    # Neue, kleine Empfänger-Methode
     def display_content(self, html_content):
         self.details.setHtml(html_content)
     
@@ -208,7 +203,22 @@ class ComposeDialog(QDialog):
         self.accept()
 
 class MailWorker(QObject):
-    mail_loaded = pyqtSignal(int, str, str, str)
+    mail_loaded = pyqtSignal(int, str, str, str, str)
+    
+    def get_local_formated_date(self, date_str):
+        if not date_str:
+            return None
+        
+        cleaned_str = re.sub(r'^[^0-9]*', '', date_str)
+        
+        try:
+            dt = parsedate_to_datetime(cleaned_str)
+            dt_local = dt.astimezone()
+            return dt_local.strftime("%H:%M:%S %d.%m.%y")
+        except Exception as e:
+            print(f'Error while formatting date str: {date_str} with error: {e}')
+            return None
+            
     def run(self):
         with imaplib.IMAP4_SSL("imap.gmail.com") as mail_server:
             mail_server.login(os.getenv("EMAIL_USER"), os.getenv("EMAIL_PASSWORD"))
@@ -217,18 +227,24 @@ class MailWorker(QObject):
             status, data = mail_server.search(None, "ALL")
             mail_ids = data[0].split()
             mail_ids.reverse()
+            id_string = b",".join(mail_ids).decode()
+            
+            status, fetch_data = mail_server.fetch(id_string, "(RFC822.HEADER)")
 
-            for row_index, mail_id in enumerate(mail_ids[:15]):
-                status, mail_data = mail_server.fetch(mail_id, "(RFC822.HEADER)")
-                loaded_msg = email.message_from_bytes(mail_data[0][1])
+            for item in fetch_data:
+                if isinstance(item, tuple):
+                    loaded_msg = email.message_from_bytes(item[1])
+                    
+                    loaded_sender = loaded_msg["From"]
+                    loaded_subject = loaded_msg["Subject"]
+                    loaded_date = loaded_msg["Date"]
 
-                # .get() verhindert Fehler, falls mal ein Betreff komplett leer ist
-                loaded_sender = loaded_msg.get("From", "Unbekannt")
-                loaded_subject = loaded_msg.get("Subject", "Kein Betreff")
+                    formated_date = self.get_local_formated_date(loaded_date)
 
-                mail_id_str = mail_id.decode()
-                
-                self.mail_loaded.emit(row_index, loaded_sender, loaded_subject, mail_id_str)
+                    msg_num = item[0].split()[0]
+                    mail_id_str = msg_num.decode()
+                    row_index = mail_ids.index(msg_num)
+                    self.mail_loaded.emit(row_index, loaded_sender, loaded_subject, formated_date, mail_id_str)
 
 
         
