@@ -1,6 +1,4 @@
-import imaplib
 import logging
-import os
 import sys
 
 import credentials
@@ -17,10 +15,8 @@ logging.basicConfig(
 
 from smtplib import SMTP_SSL
 
-from PyQt6.QtCore import (QItemSelectionModel, QObject, Qt, QThread, QTimer,
-                          pyqtSignal)
-from PyQt6.QtGui import (QAction, QBrush, QColor, QCursor, QFont, QKeySequence,
-                         QPen, QShortcut)
+from PyQt6.QtCore import Qt, QThread, QTimer
+from PyQt6.QtGui import QAction, QBrush, QColor, QFont, QKeySequence, QPen, QShortcut
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QDialog,
                              QHBoxLayout, QHeaderView, QLabel, QLineEdit,
@@ -29,9 +25,8 @@ from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QDialog,
                              QStyledItemDelegate, QTableWidget,
                              QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget)
 
-from helper import (create_email, decode_imap_folder, extract_email_body,
-                    get_local_formated_date)
-from workers import MailContentWorker, MailWorker
+from helper import create_email, decode_imap_folder
+from workers import DeleteMailWorker, IMAPAuthWorker, MailContentWorker, MailWorker
 
 
 class HoverTableWidget(QTableWidget):
@@ -366,27 +361,6 @@ QMenuBar::item:pressed {
 """
 
 
-class IMAPAuthWorker(QObject):
-    """
-    Worker task to verify credentials by attempting to log in to GMail IMAP.
-    """
-
-    finished = pyqtSignal(bool, str)
-
-    def __init__(self, email_user, email_password):
-        super().__init__()
-        self.email_user = email_user
-        self.email_password = email_password
-
-    def run(self):
-        try:
-            with imaplib.IMAP4_SSL("imap.gmail.com") as server:
-                server.login(self.email_user, self.email_password)
-            self.finished.emit(True, "")
-        except Exception as e:
-            self.finished.emit(False, str(e))
-
-
 class CredentialsDialog(QDialog):
     """
     Setup dialog to enter and securely save email credentials to Keychain.
@@ -538,6 +512,19 @@ class MainWindow(QMainWindow):
 
         self.init_ui()
 
+    def _launch_worker(self, worker, thread, done_signal):
+        """Moves worker to thread, registers cleanup signals, and starts the thread."""
+        worker.moveToThread(thread)
+        self.active_threads.add(thread)
+        self.active_workers.add(worker)
+        thread.started.connect(worker.run)
+        done_signal.connect(thread.quit)
+        done_signal.connect(worker.deleteLater)
+        done_signal.connect(lambda *_: self.active_workers.discard(worker))
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(lambda: self.active_threads.discard(thread))
+        thread.start()
+
     def init_ui(self):
         """Initializes the user interface and sets up the layout and polling timer."""
         # Set up a polling timer to check for updates every 10 seconds
@@ -584,6 +571,12 @@ class MainWindow(QMainWindow):
         # Ctrl+L: jump focus to the email list
         focus_list = QShortcut(QKeySequence("Ctrl+L"), self)
         focus_list.activated.connect(self.overview.setFocus)
+
+        # Delete / Backspace: delete selected email
+        del_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Delete), self)
+        del_shortcut.activated.connect(self.delete_selected_mail_shortcut)
+        bs_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Backspace), self)
+        bs_shortcut.activated.connect(self.delete_selected_mail_shortcut)
 
     def setup_menu_bar(self):
         """Sets up the top menu bar actions and hotkeys."""
@@ -827,6 +820,44 @@ class MainWindow(QMainWindow):
         else:
             sys.exit(0)
 
+    def delete_selected_mail_shortcut(self):
+        """Handles delete shortcuts for the currently selected row."""
+        selected = self.overview.selectionModel().selectedRows()
+        if not selected:
+            return
+        row = selected[0].row()
+        self.delete_mail(row)
+
+    def delete_mail(self, row):
+        """Deletes the mail at the given row by spawning a DeleteMailWorker."""
+        mail_id = self.mail_storage.get(row)
+        if not mail_id:
+            return
+
+        confirm = QMessageBox.question(
+            self,
+            "Delete Mail",
+            "Möchtest du diese E-Mail wirklich löschen?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        self.statusBar().showMessage("Lösche E-Mail...")
+        worker = DeleteMailWorker(mail_id, self.current_folder)
+        thread = QThread()
+
+        def on_delete_finished(success, err_msg):
+            if success:
+                self.statusBar().showMessage("E-Mail erfolgreich gelöscht.", 3000)
+                self.folders_loaded_once = False
+                self.start_mail_loading(force=True)
+            else:
+                self.statusBar().showMessage(f"Fehler beim Löschen: {err_msg}", 5000)
+
+        worker.finished.connect(on_delete_finished)
+        self._launch_worker(worker, thread, worker.finished)
+
     # ── Context Menu Handlers ──────────────────────────────────────────────────
 
     def show_mail_context_menu(self, position):
@@ -874,6 +905,13 @@ class MainWindow(QMainWindow):
             lambda: QApplication.clipboard().setText(sender_text)
         )
         menu.addAction(copy_sender_action)
+
+        menu.addSeparator()
+
+        delete_action = QAction("Löschen", self)
+        delete_action.triggered.connect(lambda: self.delete_mail(row))
+        delete_action.setStyleSheet("color: #ff3366;")
+        menu.addAction(delete_action)
 
         menu.exec(self.overview.viewport().mapToGlobal(position))
 
@@ -949,63 +987,35 @@ class MainWindow(QMainWindow):
         Launches the background worker to load or update emails for the active folder.
         Safely prevents thread overlapping or cleans up previous signals if forced.
         """
-        # Clean up already finished threads from our tracking set
         self.active_threads = {t for t in self.active_threads if t.isRunning()}
 
-        # Check if any loading thread is currently running
         if not force and self.active_threads:
             logging.info("Ladevorgang läuft noch, überspringe dieses Intervall.")
             return
 
-        # If forcing (e.g. folder changed), disconnect active workers from UI callbacks
         if force and self.active_threads:
-            logging.info(
-                "Anderer Ordner gewählt, trenne Signale der laufenden Hintergrund-Worker."
-            )
+            logging.info("Anderer Ordner gewählt, trenne Signale der laufenden Hintergrund-Worker.")
             for active_worker in list(self.active_workers):
-                try:
-                    active_worker.mail_loaded.disconnect(self.on_mail_loaded)
-                except (TypeError, AttributeError):
-                    pass
-                try:
-                    active_worker.folders_loaded.disconnect(self.populate_folders)
-                except (TypeError, AttributeError):
-                    pass
-                try:
-                    active_worker.error_occurred.disconnect(self.on_worker_error)
-                except (TypeError, AttributeError):
-                    pass
+                for sig_name in ("mail_loaded", "folders_loaded", "error_occurred"):
+                    sig = getattr(active_worker, sig_name, None)
+                    if sig:
+                        try:
+                            sig.disconnect()
+                        except (TypeError, AttributeError):
+                            pass
 
-        # Determine loading state (First start vs Update check)
         self.is_updating = getattr(self, "top_mail_id", None) is not None
 
-        thread = QThread()
-        worker = MailWorker(
-            self.current_folder, load_folders=not self.folders_loaded_once
-        )
+        worker = MailWorker(self.current_folder, load_folders=not self.folders_loaded_once)
         worker.top_mail_id = getattr(self, "top_mail_id", None)
-        worker.moveToThread(thread)
+        thread = QThread()
 
-        self.active_threads.add(thread)
-        self.active_workers.add(worker)
-
-        thread.started.connect(worker.run)
         worker.mail_loaded.connect(self.on_mail_loaded)
         worker.error_occurred.connect(self.on_worker_error)
-
-        # Connect dynamic folder listing only once on startup
         if not self.is_updating:
             worker.folders_loaded.connect(self.populate_folders)
 
-        # Thread/Worker lifetime management to prevent memory leaks
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        worker.finished.connect(lambda w=worker: self.active_workers.discard(w))
-
-        thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(lambda t=thread: self.active_threads.discard(t))
-
-        thread.start()
+        self._launch_worker(worker, thread, worker.finished)
 
     def on_mail_loaded(self, row, sender, subject, date, mail_id, is_read):
         """
@@ -1055,45 +1065,28 @@ class MainWindow(QMainWindow):
 
         self.details.setHtml("<h3>⏳ Lade E-Mail-Inhalt...</h3>")
 
-        # Disconnect previous content worker signals if still running to avoid UI display overlaps
-        if (
-            getattr(self, "content_thread", None) is not None
-            and self.content_thread.isRunning()
-        ):
+        # Mark the row as read visually by removing bold
+        normal_font = QFont()
+        normal_font.setBold(False)
+        for col in range(self.overview.columnCount()):
+            item = self.overview.item(row, col)
+            if item:
+                item.setFont(normal_font)
+
+        # Disconnect stale content worker to avoid rendering a previous email over the new one
+        prev_worker = getattr(self, "_content_worker", None)
+        if prev_worker is not None:
             try:
-                self.content_worker.content_loaded.disconnect(self.display_content)
-            except (TypeError, AttributeError):
+                prev_worker.content_loaded.disconnect(self.display_content)
+            except (TypeError, AttributeError, RuntimeError):
                 pass
 
-        # Protect content worker/thread from garbage collection by adding them to the tracking sets
-        self.content_worker = MailContentWorker(mail_id, self.current_folder)
-        self.content_thread = QThread()
+        worker = MailContentWorker(mail_id, self.current_folder)
+        thread = QThread()
+        self._content_worker = worker
 
-        self.content_worker.moveToThread(self.content_thread)
-        self.active_threads.add(self.content_thread)
-        self.active_workers.add(self.content_worker)
-
-        self.content_thread.started.connect(self.content_worker.run)
-        self.content_worker.content_loaded.connect(self.display_content)
-
-        self.content_worker.content_loaded.connect(self.content_thread.quit)
-        self.content_worker.content_loaded.connect(self.content_worker.deleteLater)
-        self.content_worker.content_loaded.connect(
-            lambda *args, w=self.content_worker: self.active_workers.discard(w)
-        )
-
-        self.content_thread.finished.connect(self.content_thread.deleteLater)
-        self.content_thread.finished.connect(
-            lambda *args, t=self.content_thread: self.active_threads.discard(t)
-        )
-        self.content_thread.finished.connect(
-            lambda: setattr(self, "content_thread", None)
-        )
-        self.content_thread.finished.connect(
-            lambda: setattr(self, "content_worker", None)
-        )
-
-        self.content_thread.start()
+        worker.content_loaded.connect(self.display_content)
+        self._launch_worker(worker, thread, worker.content_loaded)
 
     def display_content(self, html_content):
         self.details.setHtml(html_content)
