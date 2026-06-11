@@ -1,4 +1,5 @@
 import os
+import binascii
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -8,6 +9,47 @@ from email.message import EmailMessage
 
 import time
 import datetime
+
+def decode_imap_folder(s):
+    """
+    Decodes an IMAP mailbox folder name from modified UTF-7 (RFC 3501) to standard unicode.
+    For example, 'Entw&APw-rfe' becomes 'Entwürfe'.
+    
+    Args:
+        s (str): The raw folder name from the IMAP server.
+        
+    Returns:
+        str: Decoded readable folder name.
+    """
+    res = []
+    i = 0
+    while i < len(s):
+        if s[i] == '&':
+            j = s.find('-', i)
+            if j == -1:
+                res.append(s[i:])
+                break
+            part = s[i+1:j]
+            if not part:
+                res.append('&')
+            else:
+                # IMAP modified UTF-7 uses comma instead of slash
+                modified_b64 = part.replace(',', '/')
+                # Add base64 padding if necessary
+                pad = len(modified_b64) % 4
+                if pad:
+                    modified_b64 += '=' * (4 - pad)
+                try:
+                    utf16_bytes = binascii.a2b_base64(modified_b64)
+                    decoded_part = utf16_bytes.decode('utf-16-be')
+                    res.append(decoded_part)
+                except Exception:
+                    res.append(s[i:j+1])
+            i = j + 1
+        else:
+            res.append(s[i])
+            i += 1
+    return "".join(res)
 
 def get_local_formated_date(date_str):
     """
@@ -52,15 +94,18 @@ def extract_email_body(msg):
         for part in msg.walk():
             # Prioritize HTML content for rich text rendering in QWebEngineView
             if part.get_content_type() == "text/html":
-                content = part.get_payload(decode=True).decode(errors="ignore")
+                charset = part.get_content_charset() or "utf-8"
+                content = part.get_payload(decode=True).decode(charset, errors="ignore")
                 break
     else:
         # For singlepart emails, directly decode payload
-        content = msg.get_payload(decode=True).decode(errors="ignore")
+        charset = msg.get_content_charset() or "utf-8"
+        content = msg.get_payload(decode=True).decode(charset, errors="ignore")
     
     # Fallback to the main payload if content is still empty
     if not content:
-        content = msg.get_payload(decode=True).decode(errors="ignore")
+        charset = msg.get_content_charset() or "utf-8"
+        content = msg.get_payload(decode=True).decode(charset, errors="ignore")
         
     return content
 
@@ -82,3 +127,5 @@ def create_email(sender, receiver, subject, body):
     msg["From"] = sender
     msg["To"] = receiver
     msg.set_content(body)
+    print(f'Created email message: {msg["Subject"]}')
+    return msg
