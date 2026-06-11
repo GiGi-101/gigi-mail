@@ -5,57 +5,80 @@ load_dotenv()
 
 import imaplib
 import email
+import datetime
 
-from PyQt6.QtWidgets import QApplication, QMainWindow, QStatusBar, QWidget, QHBoxLayout, QVBoxLayout, QListWidget, QTableWidget, QStackedWidget, QDialog, QLineEdit, QTextEdit, QPushButton, QTableWidgetItem, QLabel
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QStatusBar, QWidget, QHBoxLayout, 
+    QVBoxLayout, QListWidget, QTableWidget, QStackedWidget, QDialog, 
+    QLineEdit, QTextEdit, QPushButton, QTableWidgetItem, QLabel
+)
 from PyQt6.QtGui import QAction
 from PyQt6.QtCore import QTimer, QThread, QObject, pyqtSignal
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from smtplib import SMTP_SSL
 
-from email.message import EmailMessage
-from email.utils import parsedate_to_datetime
-
 from helper import create_email, get_local_formated_date, extract_email_body
 
 class MailContentWorker(QObject):
-    # send html to MainWindow 
+    """
+    Worker thread task for fetching the HTML or text body of a specific email.
+    """
     content_loaded = pyqtSignal(str) 
 
-    def __init__(self, mail_id):
+    def __init__(self, mail_id, folder="Inbox"):
         super().__init__()
         self.mail_id = mail_id
+        self.folder = folder
 
     def run(self):
+        """
+        Connects to IMAP, selects the active folder, and fetches the full email body.
+        """
         try:
             with imaplib.IMAP4_SSL("imap.gmail.com") as mail_server:
                 mail_server.login(os.getenv("EMAIL_USER"), os.getenv("EMAIL_PASSWORD"))
-                mail_server.select("INBOX")
+                
+                # Normalize folder name for Gmail IMAP selection
+                actual_folder = self.folder
+                if actual_folder.lower() == "sent":
+                    actual_folder = "[Gmail]/Sent Mail"
+                mail_server.select(actual_folder)
                 
                 status, mail_data = mail_server.fetch(self.mail_id, "(RFC822)")
-
                 loaded_msg = email.message_from_bytes(mail_data[0][1])
 
+                # Extract content using the utility function from helper.py
                 content = extract_email_body(loaded_msg)
-
                 self.content_loaded.emit(content)
 
         except Exception as e:
             self.content_loaded.emit(f"Fehler beim Laden: {e}")
 
 class MainWindow(QMainWindow):
+    """
+    Main application window hosting folders list, emails overview table,
+    and the webview for email details. Handles thread instantiation and QTimer polling.
+    """
     def __init__(self):
         super().__init__()
         self.setWindowTitle("GiGi MAils")
         screen_geo = QApplication.primaryScreen().availableGeometry()
         self.resize(screen_geo.size())
         
+        # Track active folder name and mail storage dynamically
+        self.current_folder = "Inbox"
+        self.mail_storage = {}
+        self.top_mail_id = None
+        
         self.init_ui()
         
     def init_ui(self):
+        # Set up a polling timer to check for updates every 10 seconds
         self.update_timer = QTimer(self)
         self.update_timer.timeout.connect(self.start_mail_loading)
-        self.update_timer.start(10000)  # Alle 10 Sekunden überprüfen
+        self.update_timer.start(10000)
         
+        # Menu Bar
         menuBar = self.menuBar()
         file_menu = menuBar.addMenu("File")
         
@@ -70,22 +93,26 @@ class MainWindow(QMainWindow):
         file_menu.addAction(exit_action)
         file_menu.addAction(new_mail_action)
         
-        # layout
+        # Main Layout
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
-        
         main_layout = QHBoxLayout()
         main_widget.setLayout(main_layout)
         
+        # Folders List Widget (Left Pane)
         self.list_widget = QListWidget()
         main_layout.addWidget(self.list_widget)
+        self.list_widget.addItem("Inbox")
+        self.list_widget.addItem("Sent")
+        self.list_widget.currentTextChanged.connect(self.on_folder_changed)
         
-        #right row
+        # Stacked Layout Manager for Right Pane (Overview vs. Detail view)
         self.manager_layout = QStackedWidget()
         self.page_overview = QWidget()
         self.page_overview_layout = QVBoxLayout()
         self.page_overview.setLayout(self.page_overview_layout)
         
+        # Details Web View
         self.details = QWebEngineView()
         self.details.setMinimumHeight(400)
         self.back_button = QPushButton("Back")
@@ -94,7 +121,6 @@ class MainWindow(QMainWindow):
         self.page_details = QWidget()
         self.page_details_layout = QVBoxLayout()
         self.page_details.setLayout(self.page_details_layout)
-        
         self.page_details_layout.addWidget(self.back_button)
         self.page_details_layout.addWidget(self.details)
         
@@ -103,14 +129,13 @@ class MainWindow(QMainWindow):
         
         content_layout = QVBoxLayout()
         content_layout.addWidget(self.manager_layout)
+        
+        # Overview Table Widget
         self.overview = QTableWidget()
         self.overview.setColumnCount(3)
         self.overview.setHorizontalHeaderLabels(["Sender", "Subject", "Date Received"])
         self.overview.setRowCount(0)
         self.page_overview_layout.addWidget(self.overview)
-
-        #mail content
-
         self.overview.cellClicked.connect(self.show_details)
         
         main_layout.addLayout(content_layout)
@@ -118,39 +143,70 @@ class MainWindow(QMainWindow):
         self.setStatusBar(QStatusBar(self))
         self.statusBar().showMessage("Bereit")
 
+        # Start initial email and folder loading
         self.start_mail_loading()
 
-        self.mail_storage = {}
-        
     def open_compose_dialog(self):
+        """
+        Opens the modal dialog to compose and send a new email.
+        """
         dialog = ComposeDialog()
         dialog.exec()
 
+    def populate_folders(self, folders):
+        """
+        Fills the list widget with folders fetched dynamically from the server.
+        """
+        self.list_widget.clear()
+        for folder in folders:
+            self.list_widget.addItem(folder)
+        
     def start_mail_loading(self):
+        """
+        Launches the background worker to load or update emails for the active folder.
+        Safely prevents thread overlapping if a network transaction is currently active.
+        """
+        if getattr(self, 'loading_thread', None) is not None and self.loading_thread.isRunning():
+            print(f'{datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}   | Ladevorgang läuft noch, überspringe dieses Intervall.')
+            return
+        
+        # Determine loading state (First start vs Update check)
+        self.is_updating = getattr(self, 'top_mail_id', None) is not None
+        
         self.loading_thread = QThread()
-        self.worker = MailWorker()
+        self.worker = MailWorker(self.current_folder)
         self.worker.top_mail_id = getattr(self, 'top_mail_id', None)
         self.worker.moveToThread(self.loading_thread)
         
         self.loading_thread.started.connect(self.worker.run)
         self.worker.mail_loaded.connect(self.on_mail_loaded)
         
-        #clean up worker
-        self.worker.finished.connect(self.loading_thread.quit)                  #quit thread
-        self.worker.finished.connect(self.worker.deleteLater)                   #delete from ram
-        self.loading_thread.finished.connect(self.loading_thread.deleteLater)   #delete thread after stopping
+        # Connect dynamic folder listing only once on startup
+        if not self.is_updating:
+            self.worker.folders_loaded.connect(self.populate_folders)
+        
+        # Thread/Worker lifetime management to prevent memory leaks
+        self.worker.finished.connect(self.loading_thread.quit)
+        self.worker.finished.connect(self.worker.deleteLater)
+        self.loading_thread.finished.connect(self.loading_thread.deleteLater)
+        self.loading_thread.finished.connect(lambda: setattr(self, 'loading_thread', None))
         
         self.loading_thread.start()
 
     def on_mail_loaded(self, row, sender, subject, date, mail_id):
-        if self.overview.rowCount() > 0 and getattr(self, "top_mail_id", None) is not None:
+        """
+        Triggered when a new email header is fetched by the worker.
+        Handles shifting the table indices if inserting a new mail at index 0.
+        """
+        if self.is_updating:
+            # New emails should appear at the top. Shift keys in mail_storage dictionary.
             target_row = 0
             new_storage = {}
-            
             for row_id, m_id in self.mail_storage.items():
-                new_storage[row_id+1] = m_id
+                new_storage[row_id + 1] = m_id
             self.mail_storage = new_storage
         else:
+            # Initial loading: Append emails chronologically to the end of the table
             target_row = self.overview.rowCount()
             
         current_count = target_row
@@ -163,6 +219,9 @@ class MainWindow(QMainWindow):
         self.top_mail_id = self.mail_storage[0]
         
     def show_details(self, row, column):
+        """
+        Transitions UI to details view and spawns MailContentWorker to load email body.
+        """
         mail_id = self.mail_storage.get(row)
         self.manager_layout.setCurrentIndex(1)
         if not mail_id:
@@ -170,11 +229,10 @@ class MainWindow(QMainWindow):
 
         self.details.setHtml("<h3>⏳ Lade E-Mail-Inhalt...</h3>")
 
-        self.content_worker = MailContentWorker(mail_id)
+        self.content_worker = MailContentWorker(mail_id, self.current_folder)
         self.content_thread = QThread()
         
         self.content_worker.moveToThread(self.content_thread)
-        
         self.content_thread.started.connect(self.content_worker.run)
         self.content_worker.content_loaded.connect(self.display_content) 
         
@@ -189,25 +247,37 @@ class MainWindow(QMainWindow):
     
     def back_to_overview(self):
         self.manager_layout.setCurrentIndex(0)
+    
+    def on_folder_changed(self, folder_name):
+        """
+        Resets data storage and launches a reload operation when another folder is selected.
+        """
+        if not folder_name:
+            return
+        
+        self.overview.setRowCount(0)
+        self.mail_storage = {}
+        self.top_mail_id = None
+        self.current_folder = folder_name
+        self.start_mail_loading()
         
 class ComposeDialog(QDialog):
+    """
+    Modal window dialog to compose a new email message.
+    """
     def __init__(self):
         super().__init__()
         dialog_layout = QVBoxLayout()
-        l1 = QLabel()
-        l2 = QLabel()
-        l3 = QLabel()
-        l4 = QLabel()
-        
-        self.setLayout(dialog_layout)
-        l1.setText("Receiver:")
+        l1 = QLabel("Receiver:")
         self.receiver = QLineEdit("joners.guenther@gmail.com")
-        l2.setText("Subject:")
+        l2 = QLabel("Subject:")
         self.subject = QLineEdit()
-        l3.setText("Body:")
+        l3 = QLabel("Body:")
         self.text = QTextEdit()
         self.send_button = QPushButton("Send")
         self.send_button.clicked.connect(self.send_mail)
+        
+        self.setLayout(dialog_layout)
         dialog_layout.addWidget(l1)
         dialog_layout.addWidget(self.receiver)
         dialog_layout.addWidget(l2)
@@ -216,89 +286,126 @@ class ComposeDialog(QDialog):
         dialog_layout.addWidget(self.text)
         dialog_layout.addWidget(self.send_button)
         
-        
     def send_mail(self):
-        msg =  create_email(os.getenv("EMAIL_USER"),self.receiver.text(),self.subject.text(),self.text.toPlainText()) #sender, receiver, subject, body
+        """
+        Constructs the EmailMessage and sends it using SMTP_SSL.
+        """
+        msg = create_email(os.getenv("EMAIL_USER"), self.receiver.text(), self.subject.text(), self.text.toPlainText())
         
-        with SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(os.getenv("EMAIL_USER"), os.getenv("EMAIL_PASSWORD"))
-            server.send_message(msg)
-        
+        try:
+            with SMTP_SSL("smtp.gmail.com", 465) as server:
+                server.login(os.getenv("EMAIL_USER"), os.getenv("EMAIL_PASSWORD"))
+                server.send_message(msg)
+        except Exception as e:
+            print(f"Error while sending email: {e}")
+            
         self.accept()
 
 class MailWorker(QObject):
-    def __init__(self):
+    """
+    Worker task responsible for executing network requests to fetch folder lists,
+    querying the server for new email IDs, and downloading email header contents.
+    """
+    mail_loaded = pyqtSignal(int, str, str, str, str)
+    finished = pyqtSignal()
+    folders_loaded = pyqtSignal(list)
+
+    def __init__(self, folder="Inbox"):
         super().__init__()
         self.top_mail_id = None
-    
-    mail_loaded = pyqtSignal(int, str, str, str, str)
-    finished = pyqtSignal() # new signal
+        self.folder = folder
     
     def run(self):
+        """
+        Establishes SSL connection to GMail IMAP. Queries directory structures,
+        selects active folder, and pulls down headers for new/initial emails.
+        """
         try:
             with imaplib.IMAP4_SSL("imap.gmail.com") as mail_server:
                 mail_server.login(os.getenv("EMAIL_USER"), os.getenv("EMAIL_PASSWORD"))
-                mail_server.select("INBOX")
-                #search all mails
+                
+                # Fetch directory listings from IMAP server
+                status, folder_data = mail_server.list()
+                folders = []
+                for line in folder_data:
+                    if line:
+                        parts = line.decode().split(' "/" ')
+                        if len(parts) > 1:
+                            folder_name = parts[-1].strip('"')
+                            folders.append(folder_name)
+                self.folders_loaded.emit(folders)
+                
+                # Normalize folder selection path
+                actual_folder = self.folder
+                if actual_folder.lower() == "sent":
+                    actual_folder = "[Gmail]/Sent Mail"
+                mail_server.select(actual_folder)
+                
+                # Fetch message IDs
                 status, data = mail_server.search(None, "ALL")
                 mail_ids = data[0].split()
+                if not mail_ids:
+                    return
+
                 newest_mail_id = int(mail_ids[-1].decode())
+                
+                # Determine loading paths: First initialization vs dynamic update polling
                 if self.top_mail_id is None:
-                    print(f'initial load')
-                    target_ids = mail_ids[-15:]
+                    print(f'{datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}   | initial load')
+                    target_ids = mail_ids  # Pull all emails initially as requested
                     id_string = b",".join(target_ids).decode()
+                    
                     status, fetch_data = mail_server.fetch(id_string, "(RFC822.HEADER)")    
                     reversed_data = reversed(fetch_data)
                     
                     for item in reversed_data:
-                            if isinstance(item, tuple):
-                                loaded_msg = email.message_from_bytes(item[1])                    
-                                loaded_sender = loaded_msg["From"]
-                                loaded_subject = loaded_msg["Subject"]
-                                loaded_date = loaded_msg["Date"]
+                        if isinstance(item, tuple):
+                            loaded_msg = email.message_from_bytes(item[1])                    
+                            loaded_sender = loaded_msg.get("From", "Unbekannt")
+                            loaded_subject = loaded_msg.get("Subject", "Kein Betreff")
+                            loaded_date = loaded_msg.get("Date", "")
 
-                                formated_date = get_local_formated_date(loaded_date)
-
-                                msg_num = item[0].split()[0]
-                                mail_id_str = msg_num.decode()
-                                row_index = mail_ids.index(msg_num)
-                                self.mail_loaded.emit(row_index, loaded_sender, loaded_subject, formated_date, mail_id_str)
+                            formated_date = get_local_formated_date(loaded_date)
+                            msg_num = item[0].split()[0]
+                            mail_id_str = msg_num.decode()
+                            row_index = mail_ids.index(msg_num)
+                            self.mail_loaded.emit(row_index, loaded_sender, loaded_subject, formated_date, mail_id_str)
+                            
                 elif newest_mail_id > int(self.top_mail_id):
-                        print(f"Neue E-Mails gefunden! Neueste ID: {newest_mail_id}")
-                        new_ids = [mid for mid in mail_ids if int(mid) > int(self.top_mail_id)]
-                        id_string = b",".join(new_ids).decode()
-                        
-                        status, fetch_data = mail_server.fetch(id_string, "(RFC822.HEADER)")
-                        reversed_data = reversed(fetch_data)
-                        
-                        for item in reversed_data:
-                            if isinstance(item, tuple):
-                                loaded_msg = email.message_from_bytes(item[1])                    
-                                loaded_sender = loaded_msg["From"]
-                                loaded_subject = loaded_msg["Subject"]
-                                loaded_date = loaded_msg["Date"]
+                    print(f'{datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}   | Neue E-Mails gefunden! Neueste ID: {newest_mail_id}')
+                    # Filter IDs to fetch headers only for newly arrived emails
+                    new_ids = [mid for mid in mail_ids if int(mid) > int(self.top_mail_id)]
+                    id_string = b",".join(new_ids).decode()
+                    
+                    status, fetch_data = mail_server.fetch(id_string, "(RFC822.HEADER)")
+                    reversed_data = reversed(fetch_data)
+                    
+                    for item in reversed_data:
+                        if isinstance(item, tuple):
+                            loaded_msg = email.message_from_bytes(item[1])                    
+                            loaded_sender = loaded_msg.get("From", "Unbekannt")
+                            loaded_subject = loaded_msg.get("Subject", "Kein Betreff")
+                            loaded_date = loaded_msg.get("Date", "")
 
-                                formated_date = get_local_formated_date(loaded_date)
-
-                                msg_num = item[0].split()[0]
-                                mail_id_str = msg_num.decode()
-                                row_index = mail_ids.index(msg_num)
-                                self.mail_loaded.emit(row_index, loaded_sender, loaded_subject, formated_date, mail_id_str)
+                            formated_date = get_local_formated_date(loaded_date)
+                            msg_num = item[0].split()[0]
+                            mail_id_str = msg_num.decode()
+                            row_index = mail_ids.index(msg_num)
+                            self.mail_loaded.emit(row_index, loaded_sender, loaded_subject, formated_date, mail_id_str)
                 else:
-                    print("Keine neuen E-Mails.")
+                    print(f'{datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}   | Keine neuen E-Mails.')
+                    
         except Exception as e:
-                print(f"Fehler im MailWorker: {e}")
+            print(f'{datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}   | Fehler im MailWorker: {e}')
         finally:
             self.finished.emit()
 
-        
-import signal
-# Enable Ctrl+C in terminal to terminate the application immediately
-signal.signal(signal.SIGINT, signal.SIG_DFL)
-
-app = QApplication(sys.argv)
-
-window = MainWindow()
-window.show()
-
-app.exec()
+if __name__ == "__main__":
+    import signal
+    # Enable Ctrl+C in terminal to terminate the application immediately
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    app.exec()
