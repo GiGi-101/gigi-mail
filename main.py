@@ -37,25 +37,13 @@ class MainWindow(QMainWindow):
         self.init_ui()
         
     def init_ui(self):
+        """Initializes the user interface and sets up the layout and polling timer."""
         # Set up a polling timer to check for updates every 10 seconds
         self.update_timer = QTimer(self)
         self.update_timer.timeout.connect(self.start_mail_loading)
         self.update_timer.start(10000)
         
-        # Menu Bar
-        menuBar = self.menuBar()
-        file_menu = menuBar.addMenu("File")
-        
-        exit_action = QAction("Close the awesome client", self)
-        exit_action.setShortcut("Ctrl+Q")
-        exit_action.setStatusTip("Anwendung schließen")
-        
-        new_mail_action = QAction("New Mail", self)
-        
-        exit_action.triggered.connect(self.close)
-        new_mail_action.triggered.connect(self.open_compose_dialog)
-        file_menu.addAction(exit_action)
-        file_menu.addAction(new_mail_action)
+        self.setup_menu_bar()
         
         # Main Layout
         main_widget = QWidget()
@@ -63,52 +51,79 @@ class MainWindow(QMainWindow):
         main_layout = QHBoxLayout()
         main_widget.setLayout(main_layout)
         
-        # Folders List Widget (Left Pane)
-        self.list_widget = QListWidget()
-        main_layout.addWidget(self.list_widget)
-        self.list_widget.addItem("Inbox")
-        self.list_widget.addItem("Sent")
-        self.list_widget.currentTextChanged.connect(self.on_folder_changed)
-        
-        # Stacked Layout Manager for Right Pane (Overview vs. Detail view)
-        self.manager_layout = QStackedWidget()
-        self.page_overview = QWidget()
-        self.page_overview_layout = QVBoxLayout()
-        self.page_overview.setLayout(self.page_overview_layout)
-        
-        # Details Web View
-        self.details = QWebEngineView()
-        self.details.setMinimumHeight(400)
-        self.back_button = QPushButton("Back")
-        self.back_button.clicked.connect(self.back_to_overview)
-        
-        self.page_details = QWidget()
-        self.page_details_layout = QVBoxLayout()
-        self.page_details.setLayout(self.page_details_layout)
-        self.page_details_layout.addWidget(self.back_button)
-        self.page_details_layout.addWidget(self.details)
-        
-        self.manager_layout.addWidget(self.page_overview)
-        self.manager_layout.addWidget(self.page_details)
-        
-        content_layout = QVBoxLayout()
-        content_layout.addWidget(self.manager_layout)
-        
-        # Overview Table Widget
-        self.overview = QTableWidget()
-        self.overview.setColumnCount(3)
-        self.overview.setHorizontalHeaderLabels(["Sender", "Subject", "Date Received"])
-        self.overview.setRowCount(0)
-        self.page_overview_layout.addWidget(self.overview)
-        self.overview.cellClicked.connect(self.show_details)
-        
-        main_layout.addLayout(content_layout)
+        self.setup_sidebar(main_layout)
+        self.setup_content_pane(main_layout)
         
         self.setStatusBar(QStatusBar(self))
         self.statusBar().showMessage("Bereit")
 
         # Start initial email and folder loading
         self.start_mail_loading()
+
+    def setup_menu_bar(self):
+        """Sets up the top menu bar actions and hotkeys."""
+        menu_bar = self.menuBar()
+        file_menu = menu_bar.addMenu("File")
+        
+        exit_action = QAction("Close the awesome client", self)
+        exit_action.setShortcut("Ctrl+Q")
+        exit_action.setStatusTip("Anwendung schließen")
+        exit_action.triggered.connect(self.close)
+        
+        new_mail_action = QAction("New Mail", self)
+        new_mail_action.triggered.connect(self.open_compose_dialog)
+        
+        file_menu.addAction(exit_action)
+        file_menu.addAction(new_mail_action)
+
+    def setup_sidebar(self, parent_layout):
+        """Sets up the mailbox folder list widget on the left sidebar."""
+        self.list_widget = QListWidget()
+        parent_layout.addWidget(self.list_widget)
+        self.list_widget.addItem("Inbox")
+        self.list_widget.addItem("Sent")
+        self.list_widget.currentTextChanged.connect(self.on_folder_changed)
+
+    def setup_content_pane(self, parent_layout):
+        """Sets up the right main pane with the stacked layout (overview & details)."""
+        self.manager_layout = QStackedWidget()
+        
+        # Page 1: Overview
+        self.page_overview = QWidget()
+        self.page_overview_layout = QVBoxLayout()
+        self.page_overview.setLayout(self.page_overview_layout)
+        
+        self.setup_overview_table()
+        
+        # Page 2: Details
+        self.page_details = QWidget()
+        self.page_details_layout = QVBoxLayout()
+        self.page_details.setLayout(self.page_details_layout)
+        
+        self.details = QWebEngineView()
+        self.details.setMinimumHeight(400)
+        self.back_button = QPushButton("Back")
+        self.back_button.clicked.connect(self.back_to_overview)
+        
+        self.page_details_layout.addWidget(self.back_button)
+        self.page_details_layout.addWidget(self.details)
+        
+        # Add to manager
+        self.manager_layout.addWidget(self.page_overview)
+        self.manager_layout.addWidget(self.page_details)
+        
+        content_layout = QVBoxLayout()
+        content_layout.addWidget(self.manager_layout)
+        parent_layout.addLayout(content_layout)
+
+    def setup_overview_table(self):
+        """Sets up the table widget showing list of mails."""
+        self.overview = QTableWidget()
+        self.overview.setColumnCount(3)
+        self.overview.setHorizontalHeaderLabels(["Sender", "Subject", "Date Received"])
+        self.overview.setRowCount(0)
+        self.overview.cellClicked.connect(self.show_details)
+        self.page_overview_layout.addWidget(self.overview)
 
     def open_compose_dialog(self):
         """
